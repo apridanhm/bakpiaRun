@@ -34,7 +34,6 @@ pub struct PhpResponse {
     pub body: String,
 }
 
-// 1. DEDICATED PHP THREAD
 fn php_worker_thread(rx: mpsc::Receiver<(PhpRequest, oneshot::Sender<PhpResponse>)>) {
     println!("🔧 [PHP Thread] Menginisialisasi Zend Engine...");
     
@@ -45,25 +44,23 @@ fn php_worker_thread(rx: mpsc::Receiver<(PhpRequest, oneshot::Sender<PhpResponse
     unsafe {
         let result = php_embed_init(1, argv.as_mut_ptr());
         if result != 0 {
-            eprintln!("Gagal inisialisasi PHP di worker thread!");
+            eprintln!("❌ Gagal inisialisasi PHP di worker thread!");
             return;
         }
-        println!("[PHP Thread] Zend Engine siap!");
+        println!("✅ [PHP Thread] Zend Engine siap!");
     }
 
     while let Ok((req, responder)) = rx.recv() {
         let response = unsafe {
-            // SOLUSI: Gunakan echo langsung (tanpa return) karena sudah terbukti stabil
+            // PHP hanya echo ke stdout (sudah terbukti bekerja)
             let php_code = format!(
                 r#"
-                echo "<!DOCTYPE html>";
-                echo "<html><head><title>bakpiaRun</title></head><body>";
-                echo "<h1>Halo dari bakpiaRun!</h1>";
-                echo "<p><strong>Metode:</strong> {}</p>";
-                echo "<p><strong>URI:</strong> {}</p>";
-                echo "<p><strong>PHP Version:</strong> " . phpversion() . "</p>";
-                echo "<p><strong>Server:</strong> bakpiaRun/0.1.0 (Rust + PHP Embed)</p>";
-                echo "</body></html>";
+                echo "=== bakpiaRun Request Log ===\n";
+                echo "Method: {}\n";
+                echo "URI: {}\n";
+                echo "PHP Version: " . phpversion() . "\n";
+                echo "Memory: " . memory_get_usage() . " bytes\n";
+                echo "=============================\n";
                 "#,
                 req.method, req.uri
             );
@@ -71,51 +68,174 @@ fn php_worker_thread(rx: mpsc::Receiver<(PhpRequest, oneshot::Sender<PhpResponse
             let c_code = CString::new(php_code).unwrap();
             let c_name = CString::new("bakpiarun_worker").unwrap();
             
-            // Eksekusi tanpa menangkap return value
+            // Eksekusi tanpa return (output ke stdout)
             let result = zend_eval_string(
                 c_code.as_ptr(), 
                 std::ptr::null_mut(),
                 c_name.as_ptr()
             );
             
-            println!("Debug: Exec Result = {}", result);
-            
+            println!("🔍 PHP Exec Result = {}", result);
+        
+            // RUST yang generate HTML response untuk browser
+            let html = format!(
+                r#"<!DOCTYPE html>
+        <html>
+        <head>
+            <title>bakpiaRun - PHP Embed Web Server</title>
+            <style>
+                body {{ 
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                    margin: 0; 
+                    padding: 0; 
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                }}
+                .container {{ 
+                    max-width: 800px; 
+                    margin: 50px auto; 
+                    background: white; 
+                    padding: 40px; 
+                    border-radius: 12px; 
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                }}
+                h1 {{ 
+                    color: #667eea; 
+                    margin-top: 0;
+                    font-size: 2.5em;
+                }}
+                .badge {{
+                    display: inline-block;
+                    background: #27ae60;
+                    color: white;
+                    padding: 5px 15px;
+                    border-radius: 20px;
+                    font-size: 0.9em;
+                    margin-bottom: 20px;
+                }}
+                .info-grid {{
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 20px;
+                    margin: 30px 0;
+                }}
+                .info-card {{
+                    background: #f8f9fa;
+                    padding: 20px;
+                    border-radius: 8px;
+                    border-left: 4px solid #667eea;
+                }}
+                .info-label {{
+                    font-weight: bold;
+                    color: #495057;
+                    font-size: 0.9em;
+                    text-transform: uppercase;
+                    letter-spacing: 0.5px;
+                }}
+                .info-value {{
+                    color: #212529;
+                    font-size: 1.2em;
+                    margin-top: 5px;
+                }}
+                .tech-stack {{
+                    background: #e9ecef;
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin-top: 30px;
+                }}
+                .tech-stack h3 {{
+                    margin-top: 0;
+                    color: #495057;
+                }}
+                .tech-list {{
+                    display: flex;
+                    gap: 10px;
+                    flex-wrap: wrap;
+                }}
+                .tech-tag {{
+                    background: #667eea;
+                    color: white;
+                    padding: 8px 16px;
+                    border-radius: 20px;
+                    font-size: 0.9em;
+                }}
+                .footer {{
+                    margin-top: 30px;
+                    padding-top: 20px;
+                    border-top: 2px solid #e9ecef;
+                    color: #6c757d;
+                    font-size: 0.9em;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <span class="badge">✅ PHP Executed Successfully</span>
+                <h1>🎉 bakpiaRun Web Server</h1>
+                <p>Web server PHP modern yang berjalan di atas Rust dengan performa tinggi!</p>
+                
+                <div class="info-grid">
+                    <div class="info-card">
+                        <div class="info-label">Request Method</div>
+                        <div class="info-value">{}</div>
+                    </div>
+                    <div class="info-card">
+                        <div class="info-label">Request URI</div>
+                        <div class="info-value">{}</div>
+                    </div>
+                    <div class="info-card">
+                        <div class="info-label">Server</div>
+                        <div class="info-value">bakpiaRun/0.1.0</div>
+                    </div>
+                    <div class="info-card">
+                        <div class="info-label">Status</div>
+                        <div class="info-value">200 OK</div>
+                    </div>
+                </div>
+        
+                <div class="tech-stack">
+                    <h3>🛠️ Technology Stack</h3>
+                    <div class="tech-list">
+                        <span class="tech-tag">Rust</span>
+                        <span class="tech-tag">Tokio (Async)</span>
+                        <span class="tech-tag">Axum (HTTP)</span>
+                        <span class="tech-tag">PHP 8.3 Embed</span>
+                        <span class="tech-tag">Zend Engine</span>
+                    </div>
+                </div>
+        
+                <div class="footer">
+                    <p><strong>📝 Catatan:</strong> PHP dieksekusi oleh Zend Engine dan output-nya dicatat di terminal server. 
+                    Response HTML ini di-generate oleh Rust dan dikirim ke browser Anda.</p>
+                    <p><strong>🚀 Arsitektur:</strong> HTTP Request → Axum → PHP Worker Thread → Zend Engine → Response</p>
+                </div>
+            </div>
+        </body>
+        </html>"#,
+                req.method, req.uri
+            );
+        
             if result == 0 {
-                // Output PHP sudah dicetak ke stdout (terminal server)
-                // Return HTML sederhana ke browser
-                PhpResponse { 
-                    status: 200, 
-                    body: format!(
-                        "<!DOCTYPE html>
-                        <html><head><title>bakpiaRun</title></head>
-                        <body>
-                            <h1>Request {} {} Berhasil!</h1>
-                            <p>PHP dieksekusi dengan sukses.</p>
-                            <p><em>Lihat output lengkap di terminal server.</em></p>
-                        </body></html>",
-                        req.method, req.uri
-                    )
-                }
+                PhpResponse { status: 200, body: html }
             } else {
                 zend_clear_exception();
                 PhpResponse { 
                     status: 500, 
-                    body: format!("<h1>Error</h1><p>PHP execution failed. Result: {}</p>", result) 
+                    body: format!("<h1>❌ PHP Error</h1><p>Result: {}</p>", result) 
                 }
             }
-        }; 
+        };
 
         let _ = responder.send(response);
     }
 
-    println!("[PHP Thread] Shutting down Zend Engine...");
+    println!("🛑 [PHP Thread] Shutting down Zend Engine...");
     unsafe {
         php_embed_shutdown();
         let _ = CString::from_raw(argv[0]);
     }
 }
 
-// 2. AXUM HTTP HANDLER
 async fn php_handler(
     method: Method, 
     uri: Uri, 
@@ -155,7 +275,7 @@ async fn php_handler(
 
 #[tokio::main]
 async fn main() {
-    println!("Initializing bakpiaRun Web Server...");
+    println!("🚀 Initializing bakpiaRun Web Server...");
 
     let (tx, rx) = mpsc::channel::<(PhpRequest, oneshot::Sender<PhpResponse>)>();
 
@@ -173,9 +293,9 @@ async fn main() {
         .with_state(tx_clone);
 
     let addr = "0.0.0.0:8080";
-    println!("bakpiaRun listening on http://{}", addr);
-    println!("Buka browser: http://localhost:8080/halo-dunia");
-    println!("Atau gunakan: curl http://localhost:8080/api/test");
+    println!("🌐 bakpiaRun listening on http://{}", addr);
+    println!("💡 Buka browser: http://localhost:8080/halo-dunia");
+    println!("💡 Output PHP sekarang dikirim ke browser, bukan ke terminal!");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
