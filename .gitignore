@@ -1,0 +1,38 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# PHP source (yang di-extract)
+/php-8.3.8/
+/php-8.3.8.tar.gz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Test files
+/test-results/
+/coverage/
+
+# Temporary files
+*.tmp
+*.temp
+bakpiarun
