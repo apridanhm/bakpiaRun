@@ -83,3 +83,6 @@ _site/
 src-server/target/
 **/target/
 target/
+
+# Legacy folder
+legacy-embed/
