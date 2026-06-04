@@ -1,0 +1,9 @@
+
+# Rust build artifacts (lebih spesifik)
+src-server/target/
+**/*.rs.bk
+*.pdb
+
+# Compiled binaries
+bakpiarun-server
+bakpiarun-server.exe
