@@ -1,4 +1,4 @@
-![BakpiaRun](https://drive.google.com/file/d/1i-TBji1mVPeurn3IsLLf_UzRAFvL5sTL/view?usp=sharing)
+![BakpiaRun](https://drive.usercontent.google.com/download?id=1i-TBji1mVPeurn3IsLLf_UzRAFvL5sTL&export=download&authuser=0&confirm=t&uuid=9b4602e2-1e21-4148-a131-16178645d61c&at=AAINaIK-KlQh8EpVLdXEhavEX26N:1780559647577)
 
 
 #  bakpiaRun
