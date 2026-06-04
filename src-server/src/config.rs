@@ -1,0 +1,106 @@
+use serde::Deserialize;
+use std::env;
+use std::fs;
+//use std::path::PathBuf;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Config {
+    pub server: ServerConfig,
+    pub php: PhpConfig,
+    pub socket: SocketConfig,
+    pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServerConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PhpConfig {
+    pub docroot: String,
+    pub worker_path: String,
+    pub worker_count: usize,
+    pub memory_limit_mb: u64,
+    pub max_requests: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SocketConfig {
+    pub directory: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub file: String,
+}
+
+impl Config {
+    // Load config dari file YAML
+    pub fn load_from_file(path: &str) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read config file: {}", e))?;
+        
+        let config: Config = serde_yaml::from_str(&content)
+            .map_err(|e| format!("Failed to parse config: {}", e))?;
+        
+        Ok(config)
+    }
+
+    // Override config dengan environment variables
+    pub fn apply_env_overrides(&mut self) {
+        if let Ok(host) = env::var("BAKPIARUN_HOST") {
+            self.server.host = host;
+        }
+        
+        if let Ok(port) = env::var("BAKPIARUN_PORT") {
+            if let Ok(port_num) = port.parse::<u16>() {
+                self.server.port = port_num;
+            }
+        }
+        
+        if let Ok(docroot) = env::var("BAKPIARUN_DOCROOT") {
+            self.php.docroot = docroot;
+        }
+        
+        if let Ok(worker_count) = env::var("BAKPIARUN_WORKER_COUNT") {
+            if let Ok(count) = worker_count.parse::<usize>() {
+                self.php.worker_count = count;
+            }
+        }
+        
+        if let Ok(memory_limit) = env::var("BAKPIARUN_MEMORY_LIMIT_MB") {
+            if let Ok(limit) = memory_limit.parse::<u64>() {
+                self.php.memory_limit_mb = limit;
+            }
+        }
+    }
+
+    // Get socket path untuk worker index
+    pub fn get_worker_socket_path(&self, worker_index: usize) -> String {
+        format!("{}/worker_{}.sock", self.socket.directory, worker_index)
+    }
+
+    // Validate config
+    pub fn validate(&self) -> Result<(), String> {
+        if self.server.port == 0 {
+            return Err("Port cannot be 0".to_string());
+        }
+        
+        if self.php.worker_count == 0 {
+            return Err("Worker count must be at least 1".to_string());
+        }
+        
+        if self.php.memory_limit_mb == 0 {
+            return Err("Memory limit must be at least 1 MB".to_string());
+        }
+        
+        if self.php.max_requests == 0 {
+            return Err("Max requests must be at least 1".to_string());
+        }
+        
+        Ok(())
+    }
+}

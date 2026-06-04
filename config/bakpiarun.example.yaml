@@ -1,0 +1,17 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+php:
+  docroot: "/home/bakpiarun-dev/bakpiarun/public"
+  worker_path: "/home/bakpiarun-dev/bakpiarun/src-worker/worker.php"
+  worker_count: 4
+  memory_limit_mb: 128
+  max_requests: 1000
+
+socket:
+  directory: "/tmp/bakpiarun"
+
+logging:
+  level: "info"  # debug, info, warn, error
+  file: "/home/bakpiarun-dev/bakpiarun/logs/bakpiarun.log"

@@ -1,0 +1,1 @@
+/home/bakpiarun-dev/bakpiarun/src-server/target/debug/bakpiarun-server: /home/bakpiarun-dev/bakpiarun/src-server/src/config.rs /home/bakpiarun-dev/bakpiarun/src-server/src/main.rs /home/bakpiarun-dev/bakpiarun/src-server/src/static_file.rs
