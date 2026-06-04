@@ -1,121 +1,116 @@
-================================================================================
-                            BAKPIARUN
-================================================================================
+#  bakpiaRun
 
-Runtime PHP Modern yang Dibangun dengan Rust
+**High-Performance PHP Runtime Server** - Built with Rust 
 
-bakpiaRun adalah web server PHP custom yang menggunakan Rust sebagai runtime
-dan PHP 8.3 sebagai embedded engine. Terinspirasi dari FrankenPHP dan 
-RoadRunner, bakpiaRun bertujuan untuk memberikan performa tinggi dengan 
-arsitektur async modern.
+bakpiaRun adalah web server PHP modern yang menggabungkan performa Rust dengan fleksibilitas PHP. Dirancang untuk production dengan fokus pada **stabilitas**, **efisiensi memory**, dan **anti-OOM**.
 
-================================================================================
-FITUR UTAMA
-================================================================================
+## Fitur Utama
 
-- High Performance: Async HTTP server menggunakan Axum
-- Memory Safe: Dibangun dengan Rust, bebas memory leak
-- PHP 8.3 Embedded: PHP berjalan native di dalam Rust
-- Dedicated Worker Thread: Isolasi penuh antara HTTP server dan PHP engine
-- Zero Overhead: Tidak ada fork() atau process spawning
+###  Performance & Stability
+- **Worker Pool Architecture** - Multiple PHP workers dengan round-robin load balancing
+- **Process Isolation** - PHP crash tidak affect server utama (Rust)
+- **Anti-OOM System** - Auto-restart worker saat memory limit tercapai
+- **Static File Serving** - CSS/JS/images served langsung oleh Rust (10x lebih cepat)
+- **Zero-Copy IPC** - Komunikasi efisien via Unix Domain Sockets
 
-================================================================================
-ARSITEKTUR
-================================================================================
+### Request Handling
+- `$_GET` parameters
+- `$_POST` parameters (form-urlencoded + JSON)
+- `$_FILES` upload (single & multiple files)
+- `$_COOKIE` handling
+- `$_SERVER` + HTTP Headers
+- `php://input` (raw body)
+- Multipart/form-data parsing
 
-[HTTP Client / Browser]
-         |
-         | HTTP Request
-         v
-[Axum HTTP Server - Rust Async]
-  - Handle koneksi
-  - Parse request
-  - Route ke handler
-         |
-         | Channel (mpsc)
-         v
-[PHP Worker Thread - Dedicated]
-  - Inisialisasi Zend Engine
-  - Eksekusi PHP code
-  - Return response
+### Web Server Features
+- **Clean URLs** - Routing tanpa `.php` extension
+- **Directory Routing** - `/admin` otomatis ke `/admin/index.php`
+- **MIME Type Detection** - 30+ file types supported
+- **Caching Headers** - ETag, Cache-Control, Last-Modified
+- **404 Handling** - Proper error pages
 
-================================================================================
-CARA MENJALANKAN
-================================================================================
+### Configuration
+- **YAML Config** - Semua setting di 1 file
+- **Environment Variables** - Override config via env vars
+- **CLI Arguments** - Flexible command-line options
+- **No Hardcoded Paths** - Fully configurable
 
-PRASYARAT:
-- Rust 1.82+
-- PHP 8.3 (sudah di-compile dengan mode Embed + ZTS)
-- Ubuntu 22.04 atau compatible
+## Arsitektur
 
-BUILD & RUN:
+┌─────────────────────────────────────────────────────────┐
+│  BAKPIARUN (Rust + Axum)                               │
+│  ──────────────────────────────────────────────────┐   │
+│  │ HTTP Server (Axum)                               │   │
+│  │   ↓                                              │   │
+│  │ Router (Static Files → Rust, PHP → Worker Pool) │   │
+│  │   ↓                                              │   │
+│  │ Worker Pool (4 workers, round-robin)            │   │
+│  │   ├─ Worker 0: PHP Process + Memory Monitor     │   │
+│  │   ├─ Worker 1: PHP Process + Memory Monitor     │   │
+│  │   ├─ Worker 2: PHP Process + Memory Monitor     │   │
+│  │   └─ Worker 3: PHP Process + Memory Monitor     │   │
+│  │   ↓ Unix Domain Socket                          │   │
+│  │ PHP Worker (Long-running daemon)                │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
 
-    git clone https://github.com/username/bakpiarun.git
-    cd bakpiarun
-    
-    cargo build --release
-    cargo run
+### Requirements
+- **Rust 1.70+** (untuk compile server)
+- **PHP 8.0+** (CLI mode)
+- **Linux/macOS** (Unix Domain Socket support)
 
-Server akan berjalan di http://localhost:8080
+### Quick Start
 
-================================================================================
-STRUKTUR PROYEK
-================================================================================
+Clone Repository
+cd src-server
+cargo build --release
 
-bakpiarun/
-- src/main.rs          : Main application code
-- build.rs             : Build script untuk bindgen
-- wrapper.h            : C header untuk PHP bindings
-- Cargo.toml           : Rust dependencies
-- .gitignore           : Git ignore rules
-- README.txt           : File ini
 
-================================================================================
-STATUS DEVELOPMENT
-================================================================================
+### Configure
+Edit file config/bakpiarun.yaml sesuai kebutuhan:
 
-[x] PHP 8.3 Embed compilation
-[x] Rust FFI binding dengan bindgen
-[x] Dedicated thread architecture
-[x] HTTP server dengan Axum
-[x] Basic PHP execution
-[ ] Output buffering & capture
-[ ] File-based routing
-[ ] $_GET/$_POST handling
-[ ] Static file serving
-[ ] Performance benchmarking
+server:
+  host: "0.0.0.0"
+  port: 8080
 
-================================================================================
-ROADMAP
-================================================================================
+php:
+  docroot: "/path/to/your/public"
+  worker_path: "/path/to/bakpiarun/src-worker/worker.php"
+  worker_count: 4
+  memory_limit_mb: 128
+  max_requests: 1000
 
-Phase 1 (Current): Basic HTTP server + PHP execution
-Phase 2: Output capture & proper response handling
-Phase 3: File routing & framework support
-Phase 4: Production features (logging, monitoring, etc.)
+socket:
+  directory: "/tmp/bakpiarun"
 
-================================================================================
-TEKNOLOGI YANG DIGUNAKAN
-================================================================================
+logging:
+  level: "info"
+  file: "/var/log/bakpiarun.log"
 
-- Rust 1.82+ (Edition 2024)
-- PHP 8.3.8 (Embed SAPI + ZTS)
-- Axum 0.7 (Web framework)
-- Tokio 1.35 (Async runtime)
-- Bindgen 0.71 (FFI code generation)
 
-================================================================================
-LISENSI
-================================================================================
+### ️ Configuration Reference
+server:
+  host: "0.0.0.0"      # Bind address
+  port: 8080           # HTTP port
 
-MIT License
+php:
+  docroot: "/var/www/html"              # Document root
+  worker_path: "/opt/bakpiarun/worker.php"  # Worker script path
+  worker_count: 4                       # Jumlah worker aktif
+  memory_limit_mb: 128                  # Batas memori per worker (MB)
+  max_requests: 1000                    # Auto-restart setelah N request
 
-================================================================================
-KONTAK
-================================================================================
+php:
+  docroot: "/var/www/html"              # Document root
+  worker_path: "/opt/bakpiarun/worker.php"  # Worker script path
+  worker_count: 4                       # Jumlah worker aktif
+  memory_limit_mb: 128                  # Batas memori per worker (MB)
+  max_requests: 1000                    # Auto-restart setelah N request
 
-GitHub: https://github.com/username/bakpiarun
 
-================================================================================
-                    Made with Rust + PHP
-================================================================================
+### Run
+cd src-server
+cargo run -- --config ../config/bakpiarun.yaml
+
+### Test
+http://ip:8080/

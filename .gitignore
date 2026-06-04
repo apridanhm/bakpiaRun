@@ -1,39 +1,85 @@
 # Rust build artifacts
 /target
-**/*.rs.bk
+**/target/
+debug/
+release/
 
-# PHP source (yang di-extract)
-/php-8.3.8/
-/php-8.3.8.tar.gz
+# Cargo lock (optional, tapi biasanya di-commit untuk binary projects)
+# Cargo.lock
 
-# IDE
+# PHP temporary files
+*.tmp
+*.temp
+/tmp/
+/tmp/bakpiarun_uploads/
+
+# Uploaded files (user-generated content)
+/public/uploads/*
+!/public/uploads/.gitkeep
+
+# Log files
+/logs/
+*.log
+
+# IDE and editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
-Thumbs.db
 
-# Logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Environment
+# Environment files
 .env
 .env.local
 .env.*.local
 
-# Test files
-/test-results/
-/coverage/
+# Socket files
+*.sock
+/tmp/bakpiarun/
 
-# Temporary files
-*.tmp
-*.temp
-bakpiarun
-README.md
+# OS files
+Thumbs.db
+.DS_Store
+
+# Backup files
+*.bak
+*.backup
+*.orig
+
+# Config files with sensitive data
+config/bakpiarun.local.yaml
+config/*.local.yaml
+
+# Node modules (kalau ada frontend)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python (kalau ada scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+env/
+venv/
+ENV/
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test coverage
+coverage/
+*.lcov
+
+# Documentation build
+_site/
+.jekyll-cache/
+EOF
+
+# Buat .gitkeep untuk folder uploads (biar folder tetap ada di git)
+mkdir -p public/uploads
+touch public/uploads/.gitkeep
