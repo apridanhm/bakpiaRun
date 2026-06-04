@@ -37,22 +37,25 @@ bakpiaRun adalah web server PHP modern yang menggabungkan performa Rust dengan f
 
 ## Arsitektur
 
-┌─────────────────────────────────────────────────────────┐
-│  BAKPIARUN (Rust + Axum)                               │
-│  ──────────────────────────────────────────────────┐   │
-│  │ HTTP Server (Axum)                               │   │
-│  │   ↓                                              │   │
-│  │ Router (Static Files → Rust, PHP → Worker Pool) │   │
-│  │   ↓                                              │   │
-│  │ Worker Pool (4 workers, round-robin)            │   │
-│  │   ├─ Worker 0: PHP Process + Memory Monitor     │   │
-│  │   ├─ Worker 1: PHP Process + Memory Monitor     │   │
-│  │   ├─ Worker 2: PHP Process + Memory Monitor     │   │
-│  │   └─ Worker 3: PHP Process + Memory Monitor     │   │
-│  │   ↓ Unix Domain Socket                          │   │
-│  │ PHP Worker (Long-running daemon)                │   │
-│  └──────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    A[Browser Request] --> B[HTTP Server - Axum]
+    B --> C{Router}
+    C -->|Static Files| D[Rust Static Handler]
+    C -->|PHP Files| E[Worker Pool]
+    E --> F[Worker 0]
+    E --> G[Worker 1]
+    E --> H[Worker 2]
+    E --> I[Worker 3]
+    F --> J[Unix Domain Socket]
+    G --> J
+    H --> J
+    I --> J
+    J --> K[PHP Worker Process]
+    K --> L[Execute PHP Code]
+    L --> M[Response]
+    D --> M
+    M --> N[Browser]
 
 ### Requirements
 - **Rust 1.70+** (untuk compile server)
