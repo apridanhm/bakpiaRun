@@ -1,4 +1,4 @@
-![BakpiaRun](https://drive.google.com/file/d/1i-TBji1mVPeurn3IsLLf_UzRAFvL5sTL/view)
+![BakpiaRun](https://drive.google.com/file/d/1i-TBji1mVPeurn3IsLLf_UzRAFvL5sTL/view?usp=sharing)
 
 #  bakpiaRun
 
