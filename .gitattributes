@@ -1,0 +1,27 @@
+# Ignore PHP worker files (not the main codebase)
+src-worker/** linguist-vendored
+src-worker/*.php linguist-vendored
+
+# Ignore public directory (test files, not main code)
+public/** linguist-vendored
+
+# Ignore build artifacts
+target/** linguist-generated
+**/target/** linguist-generated
+
+# Ignore documentation files
+*.md linguist-documentation
+README.md linguist-documentation
+LICENSE linguist-documentation
+
+# Ignore config files
+config/** linguist-vendored
+*.yaml linguist-vendored
+*.yml linguist-vendored
+
+# Ignore shell scripts
+*.sh linguist-vendored
+
+# Focus on Rust code
+src-server/** linguist-detectable
+src-server/*.rs linguist-detectable
