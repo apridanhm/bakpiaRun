@@ -20,6 +20,9 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
+use multer::Multipart;
+use tempfile::NamedTempFile;
+use std::io::Write;
 
 #[derive(Parser, Debug)]
 #[command(name = "bakpiarun", about = "PHP Runtime Server")]
@@ -43,7 +46,9 @@ struct PhpRequest {
     body: String,
     content_type: String,
     content_length: String,
-    files: HashMap<String, FileInfo>,
+    //files: HashMap<String, FileInfo>,
+    files: HashMap<String, Vec<FileInfo>>,
+
 }
 
 #[derive(Debug, Serialize)]
@@ -52,7 +57,8 @@ struct FileInfo {
     #[serde(rename = "type")]
     content_type: String,
     size: usize,
-    content: String, // Base64 encoded
+    // content: String, // Base64 encoded
+    tmp_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,7 +286,6 @@ async fn send_to_php_worker(
 }
 
 // --- HTTP HANDLER ---
-
 async fn php_handler(
     method: Method,
     uri: Uri,
@@ -312,12 +317,13 @@ async fn php_handler(
         }
     };
     
-    // 3. Lanjut ke PHP worker - PASTIKAN PAKAI file_path DARI ROUTER!
+    // 3. Pilih worker
     let worker_index = {
         let pool = state.pool.lock().await;
         pool.get_next_worker()
     };
 
+    // 4. Pastikan worker running
     {
         let mut pool = state.pool.lock().await;
         if let Some(worker) = pool.workers.get_mut(worker_index) {
@@ -331,7 +337,7 @@ async fn php_handler(
         }
     }
 
-    // Parse headers
+    // 5. Parse headers
     let mut header_map = HashMap::new();
     for (key, value) in headers.iter() {
         if let Ok(v) = value.to_str() {
@@ -339,7 +345,7 @@ async fn php_handler(
         }
     }
 
-    // Parse cookies
+    // 6. Parse cookies
     let mut cookies = HashMap::new();
     if let Some(cookie_header) = headers.get("cookie") {
         if let Ok(cookie_str) = cookie_header.to_str() {
@@ -352,8 +358,8 @@ async fn php_handler(
         }
     }
 
-    // Read body
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    // 7. Read body
+    let body_bytes = match axum::body::to_bytes(body, 50 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -364,17 +370,103 @@ async fn php_handler(
         }
     };
 
+    let body_length = body_bytes.len();
+    let body_string = String::from_utf8_lossy(&body_bytes).to_string();
     let body_string = String::from_utf8_lossy(&body_bytes).to_string();
 
-    // Parse POST data
-    let mut post_params = HashMap::new();
+    // 8. Parse POST data dan FILES
+    //let mut post_params = HashMap::new();
+    let mut post_params: HashMap<String, String> = HashMap::new();
+    let mut files: HashMap<String, Vec<FileInfo>> = HashMap::new();
+    
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
 
-    if content_type.contains("application/x-www-form-urlencoded") {
+        if content_type.contains("multipart/form-data") {
+            let boundary = content_type
+                .split("boundary=")
+                .nth(1)
+                .map(|b| b.trim().trim_matches('"'))
+                .unwrap_or("");
+            
+            if !boundary.is_empty() {
+                let body_stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) });
+                let mut multipart = Multipart::new(body_stream, boundary);
+                
+                while let Ok(Some(field)) = multipart.next_field().await {
+                    let name = field.name().unwrap_or("").to_string();
+                    let is_file = field.file_name().is_some();
+                    let filename = field.file_name().map(|f| f.to_string());
+                    let field_content_type = field.content_type().map(|ct| ct.to_string());
+                    
+                    if is_file {
+                        if let Some(fname) = filename {
+                            // Buat temp file di folder yang sama dengan upload.php
+                            let upload_dir = "/tmp/bakpiarun_uploads/";
+                            let _ = std::fs::create_dir_all(upload_dir);
+                            
+                            let temp_path = format!("{}{}", upload_dir, format!("{}", uuid::Uuid::new_v4()));
+                            
+                            match std::fs::File::create(&temp_path) {
+                                Ok(mut file) => {
+                                    let mut field_stream = field;
+                                    let mut total_size = 0usize;
+                                    let mut write_ok = true;
+                                    
+                                    while write_ok {
+                                        match field_stream.chunk().await {
+                                            Ok(Some(chunk)) => {
+                                                use std::io::Write;
+                                                if let Err(e) = file.write_all(&chunk) {
+                                                    eprintln!("[Upload] Write error: {}", e);
+                                                    write_ok = false;
+                                                    break;
+                                                }
+                                                total_size += chunk.len();
+                                            }
+                                            Ok(None) => break,
+                                            Err(e) => {
+                                                eprintln!("[Upload] Read error: {}", e);
+                                                write_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    if write_ok {
+                                        println!("[Upload] File saved: {} ({} bytes)", fname, total_size);
+
+                                        files.entry(name.clone()).or_default().push(FileInfo {
+                                            name: fname,
+                                            content_type: field_content_type
+                                                .unwrap_or_else(|| "application/octet-stream".to_string()),
+                                            size: total_size,
+                                            tmp_path: temp_path,
+                                        });
+                                    } else {
+                                        // Cleanup failed upload
+                                        let _ = std::fs::remove_file(&temp_path);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[Upload] Failed to create file {}: {}", temp_path, e);
+                                }
+                            }
+                        }
+                    } else {
+                        if let Ok(value) = field.text().await {
+                            post_params.insert(name, value);
+                        }
+                    }
+                }
+            }
+        }
+        
+    
+    else if content_type.contains("application/x-www-form-urlencoded") {
         // Parse URL-encoded form data
         for pair in body_string.split('&') {
             let parts: Vec<&str> = pair.splitn(2, '=').collect();
@@ -387,18 +479,11 @@ async fn php_handler(
                 }
             }
         }
-    } else if content_type.contains("application/json") {
-        // Untuk JSON, kita simpan di body, tidak parse ke $_POST
-        // PHP bisa akses via json_decode(file_get_contents('php://input'))
     }
-
-    // Parse files (multipart/form-data) - simplified version
-    let files = HashMap::new(); // TODO: Implement multipart parsing
-
-    //let file_path = resolve_php_file(&state.config.php.docroot, uri.path());
 
     let query_string = uri.query().unwrap_or("").to_string();
 
+    // 9. Buat PhpRequest
     let request = PhpRequest {
         method: method.to_string(),
         uri: uri.to_string(),
@@ -410,10 +495,12 @@ async fn php_handler(
         headers: header_map,
         body: body_string,
         content_type,
-        content_length: body_bytes.len().to_string(),
+        //content_length: body_bytes.len().to_string(),
+        content_length: body_length.to_string(),
         files,
     };
 
+    // 10. Kirim ke PHP worker
     let socket_path = {
         let pool = state.pool.lock().await;
         pool.workers[worker_index].socket_path.clone()
@@ -475,7 +562,7 @@ async fn php_handler(
         }
     }
 }
-
+////////////////////////////////////////////////////////////////////////////////////////////
 fn resolve_php_file(docroot: &str, uri: &str) -> String {
     let mut path = uri.to_string();
 
