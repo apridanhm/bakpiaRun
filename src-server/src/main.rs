@@ -581,12 +581,12 @@ fn resolve_php_file(docroot: &str, uri: &str) -> String {
 async fn main() {
     let cli = Cli::parse();
 
-    println!("🚀 Initializing bakpiaRun Server with Worker Pool...");
+    println!("Initializing bakpiaRun Server with Worker Pool...");
 
     let mut config = match Config::load_from_file(&cli.config) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("❌ Failed to load config: {}", e);
+            eprintln!("Failed to load config: {}", e);
             std::process::exit(1);
         }
     };
@@ -594,11 +594,11 @@ async fn main() {
     config.apply_env_overrides();
 
     if let Err(e) = config.validate() {
-        eprintln!("❌ Invalid config: {}", e);
+        eprintln!("Invalid config: {}", e);
         std::process::exit(1);
     }
 
-    println!("📋 Configuration:");
+    println!("Configuration:");
     println!("   - Server: {}:{}", config.server.host, config.server.port);
     println!("   - Docroot: {}", config.php.docroot);
     println!("   - Worker Path: {}", config.php.worker_path);
@@ -613,7 +613,7 @@ async fn main() {
     let mut pool = WorkerPool::new(config.php.worker_count, &config);
 
     if let Err(e) = pool.start_all(&config).await {
-        eprintln!("❌ Failed to start workers: {}", e);
+        eprintln!("Failed to start workers: {}", e);
         std::process::exit(1);
     }
 
@@ -628,10 +628,10 @@ async fn main() {
         .with_state(state.clone());
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    println!("🌐 Listening on http://{}", addr);
-    println!("🛡️ Anti-OOM system active!");
-    println!("⚡ Worker pool: {} workers with round-robin load balancing", config.php.worker_count);
-    println!("📦 Request handling: GET, POST, Cookies, Headers enabled!");
+    println!("Listening on http://{}", addr);
+    println!("Anti-OOM system active!");
+    println!("Worker pool: {} workers with round-robin load balancing", config.php.worker_count);
+    println!("Request handling: GET, POST, Cookies, Headers enabled!");
 
     let pool_clone = state.pool.clone();
     let config_clone = config.clone();

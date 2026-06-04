@@ -78,8 +78,3 @@ coverage/
 # Documentation build
 _site/
 .jekyll-cache/
-EOF
-
-# Buat .gitkeep untuk folder uploads (biar folder tetap ada di git)
-mkdir -p public/uploads
-touch public/uploads/.gitkeep
