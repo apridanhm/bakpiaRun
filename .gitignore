@@ -78,3 +78,8 @@ coverage/
 # Documentation build
 _site/
 .jekyll-cache/
+
+# Rust build artifacts
+src-server/target/
+**/target/
+target/
