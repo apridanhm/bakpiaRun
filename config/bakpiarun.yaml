@@ -13,5 +13,12 @@ socket:
   directory: "/tmp/bakpiarun"
 
 logging:
+  access_log_enabled: true
+  access_log: "/home/bakpiarun-dev/bakpiarun/logs/access.log"
+  
+  error_log_enabled: true
+  error_log: "/home/bakpiarun-dev/bakpiarun/logs/error.log"
+  
   level: "info"  # debug, info, warn, error
   file: "/home/bakpiarun-dev/bakpiarun/logs/bakpiarun.log"
+

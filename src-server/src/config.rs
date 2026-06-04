@@ -33,8 +33,10 @@ pub struct SocketConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoggingConfig {
-    pub level: String,
-    pub file: String,
+    pub access_log_enabled: bool,
+    pub access_log: String,
+    pub error_log_enabled: bool,
+    pub error_log: String,
 }
 
 impl Config {
