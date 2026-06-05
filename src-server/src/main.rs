@@ -7,6 +7,7 @@ mod worker_pool;
 mod metrics;
 mod handlers;
 mod logger;
+mod rate_limiter;
 
 use clap::Parser;
 use config::Config;
@@ -21,6 +22,7 @@ use tokio::sync::Mutex;
 use axum::routing::get;
 use axum::Router;
 use tokio::time::{sleep, Duration};
+use rate_limiter::RateLimiter;
 
 #[derive(Parser, Debug)]
 #[command(name = "bakpiarun", about = "PHP Runtime Server")]
@@ -78,12 +80,19 @@ async fn main() {
         &config.logging.error_log,
     );
 
+    let rate_limiter = RateLimiter::new(
+        config.rate_limit.enabled,
+        config.rate_limit.requests_per_minute,
+        config.rate_limit.burst_size,
+    );
+
     let state = AppState {
         //config: Arc::new(config.clone()),
         config: Arc::new(Mutex::new(config.clone())),
         pool: Arc::new(Mutex::new(pool)),
         metrics: Arc::new(Mutex::new(metrics)),
         logger: Arc::new(logger),
+        rate_limiter: Arc::new(rate_limiter),
     };
 
     let app = Router::new()
@@ -111,6 +120,15 @@ async fn main() {
     });
     println!("   - Error Log:  {}", if config.logging.error_log_enabled { 
         format!("Enabled ({})", config.logging.error_log) 
+    } else { 
+        "Disabled".to_string() 
+    });
+
+    // rate limit
+    println!(" Rate Limiting: {}", if config.rate_limit.enabled { 
+        format!("Enabled ({} req/min, burst: {})", 
+            config.rate_limit.requests_per_minute,
+            config.rate_limit.burst_size)
     } else { 
         "Disabled".to_string() 
     });
@@ -183,4 +201,5 @@ async fn main() {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>()
     ).await.unwrap();
+
 }

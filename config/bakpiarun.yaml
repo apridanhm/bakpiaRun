@@ -22,3 +22,7 @@ logging:
   level: "info"  # debug, info, warn, error
   file: "/home/bakpiarun-dev/bakpiarun/logs/bakpiarun.log"
 
+rate_limit:
+  enabled: true
+  requests_per_minute: 60
+  burst_size: 10

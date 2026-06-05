@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::worker_pool::WorkerPool;
 use crate::metrics::Metrics;
 use crate::logger::Logger;
+use crate::rate_limiter::RateLimiter;
 
 #[derive(Debug, Serialize)]
 pub struct PhpRequest {
@@ -48,4 +49,5 @@ pub struct AppState {
     pub pool: Arc<Mutex<WorkerPool>>,
     pub metrics: Arc<Mutex<Metrics>>,
     pub logger: Arc<Logger>,
+    pub rate_limiter: Arc<RateLimiter>,
 }

@@ -30,6 +30,38 @@ pub async fn php_handler(
     } else {
         addr.ip().to_string()
     };
+
+    // RATE LIMIT CHECK
+    let rate_limit_headers = if let Ok(ip_addr) = client_ip.parse::<std::net::IpAddr>() {
+        match state.rate_limiter.check_rate_limit(ip_addr).await {
+            Ok(headers) => Some(headers),
+            Err(e) => {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                state.logger.log_error(
+                    "WARN",
+                    &format!("Rate limit exceeded for IP: {} (URI: {})", client_ip, uri),
+                );
+                state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 429, duration_ms);
+                
+                return axum::http::Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("Content-Type", "application/json")
+                    .header("X-RateLimit-Limit", e.limit.to_string())
+                    .header("X-RateLimit-Remaining", "0")
+                    .header("X-RateLimit-Reset", e.reset.to_string())
+                    .header("Retry-After", e.reset.to_string())
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"error":"Rate limit exceeded","limit":{},"reset":{}}}"#,
+                        e.limit, e.reset
+                    )))
+                    .unwrap()
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
     
     // LOCK CONFIG
     let config = state.config.lock().await.clone();
@@ -274,11 +306,21 @@ pub async fn php_handler(
                 }
             }
 
-            (
-                StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK),
-                [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                Html(php_response.body),
-            ).into_response()
+            let mut response = axum::http::Response::builder()
+                .status(StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK))
+                .header("Content-Type", "text/html; charset=utf-8");
+            
+            if let Some(headers) = rate_limit_headers {
+                response = response
+                    .header("X-RateLimit-Limit", headers.limit.to_string())
+                    .header("X-RateLimit-Remaining", headers.remaining.to_string())
+                    .header("X-RateLimit-Reset", headers.reset.to_string());
+            }
+            
+            response
+                .body(axum::body::Body::from(php_response.body))
+                .unwrap()
+                .into_response()
         }
         Err(e) => {
             let duration_ms = start_time.elapsed().as_millis() as u64;

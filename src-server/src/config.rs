@@ -9,7 +9,26 @@ pub struct Config {
     pub php: PhpConfig,
     pub socket: SocketConfig,
     pub logging: LoggingConfig,
+    pub rate_limit: RateLimitConfig,
 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateLimitConfig {
+    pub enabled: bool,
+    pub requests_per_minute: u32,
+    pub burst_size: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            requests_per_minute: 60,
+            burst_size: 10,
+        }
+    }
+}
+
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
@@ -105,4 +124,6 @@ impl Config {
         
         Ok(())
     }
+
+
 }

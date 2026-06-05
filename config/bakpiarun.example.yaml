@@ -5,7 +5,7 @@ server:
 php:
   docroot: "/home/bakpiarun-dev/bakpiarun/public"
   worker_path: "/home/bakpiarun-dev/bakpiarun/src-worker/worker.php"
-  worker_count: 4
+  worker_count: 8
   memory_limit_mb: 128
   max_requests: 1000
 
@@ -13,5 +13,16 @@ socket:
   directory: "/tmp/bakpiarun"
 
 logging:
+  access_log_enabled: true
+  access_log: "/home/bakpiarun-dev/bakpiarun/logs/access.log"
+  
+  error_log_enabled: true
+  error_log: "/home/bakpiarun-dev/bakpiarun/logs/error.log"
+  
   level: "info"  # debug, info, warn, error
   file: "/home/bakpiarun-dev/bakpiarun/logs/bakpiarun.log"
+
+rate_limit:
+  enabled: true
+  requests_per_minute: 60
+  burst_size: 10
