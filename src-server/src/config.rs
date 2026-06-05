@@ -79,6 +79,8 @@ impl Default for CompressionConfig {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    pub https_port: u16,
+    pub tls: TlsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -102,6 +104,13 @@ pub struct LoggingConfig {
     pub access_log: String,
     pub error_log_enabled: bool,
     pub error_log: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+    pub enabled: bool,
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 impl Config {

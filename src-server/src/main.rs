@@ -157,6 +157,14 @@ async fn main() {
     } else {
         "Disabled".to_string()
     });
+
+    if config.server.tls.enabled {
+        println!(" HTTPS: Enabled (port {})", config.server.https_port);
+        println!("   - Certificate: {}", config.server.tls.cert_path);
+        println!("   - Key: {}", config.server.tls.key_path);
+    } else {
+        println!(" HTTPS: Disabled");
+    }
     
 
     let pool_clone = state.pool.clone();
@@ -222,6 +230,32 @@ async fn main() {
         std::process::exit(0);
     });
 
+    use axum_server::tls_rustls::RustlsConfig;
+
+    if config.server.tls.enabled {
+        println!(" Setting up HTTPS server...");
+        
+        let https_addr: std::net::SocketAddr = format!("{}:{}", config.server.host, config.server.https_port)
+            .parse()
+            .expect("Invalid HTTPS address");
+        
+        let rustls_config = RustlsConfig::from_pem_file(
+            &config.server.tls.cert_path,
+            &config.server.tls.key_path,
+        )
+        .await
+        .expect("Failed to load TLS config");
+        
+        println!(" HTTPS (HTTP/2) listening on https://{}", https_addr);
+        
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            axum_server::bind_rustls(https_addr, rustls_config)
+                .serve(app_clone.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .expect("HTTPS server failed");
+        });
+    }
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(
         listener,
