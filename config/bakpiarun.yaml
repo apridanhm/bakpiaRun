@@ -49,3 +49,8 @@ security:
   
   # Control browser features (optional)
   # permissions_policy: "geolocation=(), microphone=(), camera=()"
+
+compression:
+  enabled: true
+  min_size_bytes: 1024  # Hanya compress response > 1KB
+  level: 6  # 1-9 (6 = balanced)

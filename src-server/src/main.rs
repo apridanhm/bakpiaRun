@@ -24,6 +24,7 @@ use axum::routing::get;
 use axum::Router;
 use tokio::time::{sleep, Duration};
 use rate_limiter::RateLimiter;
+use tower_http::compression::CompressionLayer;
 
 #[derive(Parser, Debug)]
 #[command(name = "bakpiarun", about = "PHP Runtime Server")]
@@ -104,6 +105,13 @@ async fn main() {
         .route("/reload", get(reload_handler))
         .with_state(state.clone());
 
+    // compression mmiddleware
+    let app = if config.compression.enabled {
+        app.layer(CompressionLayer::new())
+    } else {
+        app
+    };
+
     let addr = format!("{}:{}", config.server.host, config.server.port);
     println!(" Listening on http://{}", addr);
     println!(" Anti-OOM system active!");
@@ -141,6 +149,14 @@ async fn main() {
     println!("   - X-XSS-Protection: {}", if config.security.x_xss_protection { "Enabled" } else { "Disabled" });
     println!("   - Content-Security-Policy: {}", if config.security.content_security_policy.is_some() { "Enabled" } else { "Disabled" });
     println!("   - Referrer-Policy: {}", config.security.referrer_policy.as_deref().unwrap_or("Disabled"));
+
+    println!(" Compression: {}", if config.compression.enabled {
+        format!("Enabled (level: {}, min: {} bytes)", 
+            config.compression.level,
+            config.compression.min_size_bytes)
+    } else {
+        "Disabled".to_string()
+    });
     
 
     let pool_clone = state.pool.clone();

@@ -11,6 +11,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub rate_limit: RateLimitConfig,
     pub security: SecurityConfig,
+    pub compression: CompressionConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -52,6 +53,23 @@ impl Default for RateLimitConfig {
             enabled: false,
             requests_per_minute: 60,
             burst_size: 10,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CompressionConfig {
+    pub enabled: bool,
+    pub min_size_bytes: usize,
+    pub level: u32,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_size_bytes: 1024,
+            level: 6,
         }
     }
 }
