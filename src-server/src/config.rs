@@ -43,6 +43,7 @@ pub struct PhpConfig {
     pub worker_count: usize,
     pub memory_limit_mb: u64,
     pub max_requests: u64,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -120,6 +121,15 @@ impl Config {
         
         if self.php.max_requests == 0 {
             return Err("Max requests must be at least 1".to_string());
+        }
+
+        // validasi timeout
+        if self.php.timeout_ms == 0 {
+            return Err("Timeout cannot be 0. Set at least 1000ms (1 second)".to_string());
+        }
+        
+        if self.php.timeout_ms < 1000 {
+            return Err("Timeout too small. Minimum 1000ms (1 second) recommended".to_string());
         }
         
         Ok(())

@@ -8,6 +8,7 @@ php:
   worker_count: 8
   memory_limit_mb: 128
   max_requests: 1000
+  timeout_ms: 30000
 
 socket:
   directory: "/tmp/bakpiarun"

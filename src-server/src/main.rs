@@ -107,6 +107,7 @@ async fn main() {
     println!(" Listening on http://{}", addr);
     println!(" Anti-OOM system active!");
     println!(" Worker pool: {} workers with round-robin load balancing", config.php.worker_count);
+    println!(" Request timeout: {}ms", config.php.timeout_ms);
     println!(" Request handling: GET, POST, Cookies, Headers enabled!");
     println!(" Health check: http://{}/health", addr);
     println!(" Metrics: http://{}/metrics", addr);

@@ -264,8 +264,14 @@ pub async fn php_handler(
         pool.workers[worker_index].socket_path.clone()
     };
 
-    match send_to_php_worker(&socket_path, request).await {
-        Ok(php_response) => {
+    // WRAP DENGAN TIMEOUT
+    let timeout_duration = std::time::Duration::from_millis(config.php.timeout_ms);
+    
+    let result = tokio::time::timeout(timeout_duration, send_to_php_worker(&socket_path, request)).await;
+    
+    match result {
+        Ok(Ok(php_response)) => {
+            // request sukses dalam timeout
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_access(
                 &client_ip,
@@ -322,7 +328,8 @@ pub async fn php_handler(
                 .unwrap()
                 .into_response()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
+            // worker error (bukan timeout)
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_error(
                 "ERROR",
@@ -344,6 +351,37 @@ pub async fn php_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(format!("<h1>500 Error</h1><p>{}</p>", e)),
+            ).into_response()
+        }
+        Err(_) => {
+            // TIMEOUT EXCEEDED
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            state.logger.log_error(
+                "ERROR",
+                &format!("Request timeout after {}ms (URI: {})", config.php.timeout_ms, uri),
+            );
+            state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 504, duration_ms);
+
+            {
+                let mut metrics = state.metrics.lock().await;
+                metrics.record_error();
+            }
+            
+            // restart worker karena mungkin hang
+            {
+                let mut pool = state.pool.lock().await;
+                if let Some(worker) = pool.workers.get_mut(worker_index) {
+                    println!("[Timeout] Restarting worker #{}...", worker_index);
+                    worker.stop().await;
+                }
+            }
+            
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Html(format!(
+                    "<h1>504 Gateway Timeout</h1><p>The server did not receive a timely response from the PHP worker.</p><p>Timeout: {}ms</p>",
+                    config.php.timeout_ms
+                )),
             ).into_response()
         }
     }
