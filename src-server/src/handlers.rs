@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::types::{AppState, PhpRequest, FileInfo};
 use crate::ipc::send_to_php_worker;
 use crate::static_file;
-
+use crate::config::Config;
 
 pub async fn php_handler(
     method: Method,
@@ -21,10 +21,8 @@ pub async fn php_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Body,
 ) -> Response {
-    // TAMBAHKAN: Track waktu mulai & IP client
     let start_time = Instant::now();
-
-    // DAPETIN IP DARI TCP CONNECTION
+    
     let client_ip = if let Some(forwarded) = headers.get("x-forwarded-for") {
         forwarded.to_str().unwrap_or("unknown").to_string()
     } else if let Some(real_ip) = headers.get("x-real-ip") {
@@ -33,23 +31,24 @@ pub async fn php_handler(
         addr.ip().to_string()
     };
     
+    // LOCK CONFIG
+    let config = state.config.lock().await.clone();
+    
     let path = uri.path();
 
     if static_file::is_static_file(path) {
         println!("[Static] Serving: {}", path);
-        // Log static file juga
         state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 200, 0);
-        return static_file::serve_static_file(&state.config.php.docroot, path).await;
+        return static_file::serve_static_file(&config.php.docroot, path).await;
     }
     
-    let file_path = match static_file::find_php_file(&state.config.php.docroot, path).await {
+    let file_path = match static_file::find_php_file(&config.php.docroot, path).await {
         Some(fp) => {
             println!("[Router] {} → {}", path, fp);
             fp
         }
         None => {
             println!("[404] Not found: {}", path);
-            // Log 404
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 404, duration_ms);
             return Response::builder()
@@ -67,9 +66,8 @@ pub async fn php_handler(
     {
         let mut pool = state.pool.lock().await;
         if let Some(worker) = pool.workers.get_mut(worker_index) {
-            if let Err(e) = worker.ensure_running(&state.config).await {
+            if let Err(e) = worker.ensure_running(&config).await {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
-                // Log error saat worker gagal start
                 state.logger.log_error("ERROR", &format!("Worker #{} failed to start: {} (URI: {})", worker_index, e, uri));
                 state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
                 return (
@@ -236,7 +234,6 @@ pub async fn php_handler(
 
     match send_to_php_worker(&socket_path, request).await {
         Ok(php_response) => {
-            // TAMBAHKAN: Log access success
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_access(
                 &client_ip,
@@ -262,7 +259,7 @@ pub async fn php_handler(
                         php_response.memory / 1024 / 1024,
                         php_response.peak / 1024 / 1024
                     );
-                    worker.should_restart(&state.config)
+                    worker.should_restart(&config)
                 } else {
                     None
                 }
@@ -284,7 +281,6 @@ pub async fn php_handler(
             ).into_response()
         }
         Err(e) => {
-            // TAMBAHKAN: Log error
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_error(
                 "ERROR",
@@ -300,7 +296,7 @@ pub async fn php_handler(
             {
                 let mut pool = state.pool.lock().await;
                 if let Some(worker) = pool.workers.get_mut(worker_index) {
-                    let _ = worker.ensure_running(&state.config).await;
+                    let _ = worker.ensure_running(&config).await;
                 }
             }
             (
@@ -400,4 +396,76 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response {
         [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         Body::from(output),
     ).into_response()
+}
+
+// reload handler
+pub async fn reload_handler(State(state): State<AppState>) -> Response {
+    println!("[Reload] HTTP reload triggered");
+    
+    let config_path = std::env::current_dir()
+    .map(|p| p.join("../config/bakpiarun.yaml").to_string_lossy().to_string())
+    .unwrap_or_else(|_| "../config/bakpiarun.yaml".to_string()); // suapaya configurable
+    
+    let mut new_config = match Config::load_from_file(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let response = serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to load config: {}", e)
+            });
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                Body::from(serde_json::to_string_pretty(&response).unwrap()),
+            ).into_response();
+        }
+    };
+    
+    new_config.apply_env_overrides();
+    
+    if let Err(e) = new_config.validate() {
+        let response = serde_json::json!({
+            "status": "error",
+            "message": format!("Invalid config: {}", e)
+        });
+        return (
+            StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            Body::from(serde_json::to_string_pretty(&response).unwrap()),
+        ).into_response();
+    }
+    
+    // update shared config
+    {
+        let mut config = state.config.lock().await;
+        *config = new_config.clone();
+    }
+    
+    // rolling restart workers
+    let mut pool = state.pool.lock().await;
+    match pool.reload(&new_config).await {
+        Ok(_) => {
+            let response = serde_json::json!({
+                "status": "success",
+                "message": "Configuration reloaded successfully",
+                "workers": new_config.php.worker_count
+            });
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                Body::from(serde_json::to_string_pretty(&response).unwrap()),
+            ).into_response()
+        }
+        Err(e) => {
+            let response = serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to reload workers: {}", e)
+            });
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                Body::from(serde_json::to_string_pretty(&response).unwrap()),
+            ).into_response()
+        }
+    }
 }

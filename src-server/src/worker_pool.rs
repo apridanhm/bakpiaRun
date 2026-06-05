@@ -47,4 +47,37 @@ impl WorkerPool {
             }
         }
     }
+
+        // rolling restart untuk graceful reload
+        pub async fn reload(&mut self, config: &Config) -> Result<(), String> {
+            println!("[Reload] Starting rolling restart of workers...");
+            
+            // stop semua worker lama
+            println!("[Reload] Stopping old workers...");
+            self.stop_all().await;
+            
+            // update jumlah worker kalau berubah
+            let new_count = config.php.worker_count;
+            let old_count = self.workers.len();
+            
+            if new_count != old_count {
+                println!("[Reload] Worker count changed: {} → {}", old_count, new_count);
+                self.workers.clear();
+                for i in 0..new_count {
+                    let socket_path = config.get_worker_socket_path(i);
+                    self.workers.push(Worker::new(i, socket_path));
+                }
+            }
+            
+            // start worker baru satu-satu (rolling)
+            println!("[Reload] Starting new workers...");
+            for worker in &mut self.workers {
+                worker.start(config).await?;
+                // Delay kecil biar gak overload
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+            
+            println!("[Reload] Rolling restart complete! {} workers active", self.workers.len());
+            Ok(())
+        }
 }

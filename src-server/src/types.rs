@@ -43,7 +43,8 @@ pub struct PhpResponse {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
+    //pub config: Arc<Config>,
+    pub config: Arc<Mutex<Config>>,
     pub pool: Arc<Mutex<WorkerPool>>,
     pub metrics: Arc<Mutex<Metrics>>,
     pub logger: Arc<Logger>,

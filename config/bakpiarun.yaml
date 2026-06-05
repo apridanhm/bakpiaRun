@@ -5,7 +5,7 @@ server:
 php:
   docroot: "/home/bakpiarun-dev/bakpiarun/public"
   worker_path: "/home/bakpiarun-dev/bakpiarun/src-worker/worker.php"
-  worker_count: 4
+  worker_count: 8
   memory_limit_mb: 128
   max_requests: 1000
 

@@ -13,7 +13,7 @@ use config::Config;
 use types::AppState;
 use worker_pool::WorkerPool;
 use metrics::Metrics;
-use handlers::{php_handler, health_handler, metrics_handler};
+use handlers::{php_handler, health_handler, metrics_handler, reload_handler};
 use logger::Logger;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -79,7 +79,8 @@ async fn main() {
     );
 
     let state = AppState {
-        config: Arc::new(config.clone()),
+        //config: Arc::new(config.clone()),
+        config: Arc::new(Mutex::new(config.clone())),
         pool: Arc::new(Mutex::new(pool)),
         metrics: Arc::new(Mutex::new(metrics)),
         logger: Arc::new(logger),
@@ -90,6 +91,7 @@ async fn main() {
         .route("/*path", get(php_handler).post(php_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/reload", get(reload_handler))
         .with_state(state.clone());
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -114,12 +116,56 @@ async fn main() {
     });
 
     let pool_clone = state.pool.clone();
-    let config_clone = config.clone();
+    let config_clone = state.config.clone();
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(5)).await;
             let mut pool = pool_clone.lock().await;
-            pool.ensure_all_running(&config_clone).await;
+            let config = config_clone.lock().await;
+            pool.ensure_all_running(&config).await;
+        }
+    });
+
+    // graceful reload
+    let state_for_reload = state.clone();
+    let config_path = cli.config.clone();
+    tokio::spawn(async move {
+        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("Failed to install SIGHUP handler");
+        
+        loop {
+            sig.recv().await;
+            println!("\n[SIGHUP] Received reload signal...");
+            
+            // reload config dari file
+            let mut new_config = match Config::load_from_file(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[Reload] Failed to load config: {}", e);
+                    continue;
+                }
+            };
+            
+            new_config.apply_env_overrides();
+            
+            if let Err(e) = new_config.validate() {
+                eprintln!("[Reload] Invalid config: {}", e);
+                continue;
+            }
+            
+            println!("[Reload] Config reloaded successfully");
+            
+            // update shared config
+            {
+                let mut config = state_for_reload.config.lock().await;
+                *config = new_config.clone();
+            }
+            
+            // rolling restart workers
+            let mut pool = state_for_reload.pool.lock().await;
+            if let Err(e) = pool.reload(&new_config).await {
+                eprintln!("[Reload] Failed to reload workers: {}", e);
+            }
         }
     });
 
