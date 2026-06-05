@@ -10,7 +10,34 @@ pub struct Config {
     pub socket: SocketConfig,
     pub logging: LoggingConfig,
     pub rate_limit: RateLimitConfig,
+    pub security: SecurityConfig,
 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SecurityConfig {
+    pub x_frame_options: Option<String>,
+    pub x_content_type_options: bool,
+    pub x_xss_protection: bool,
+    pub content_security_policy: Option<String>,
+    pub strict_transport_security: Option<String>,
+    pub referrer_policy: Option<String>,
+    pub permissions_policy: Option<String>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            x_frame_options: Some("DENY".to_string()),
+            x_content_type_options: true,
+            x_xss_protection: true,
+            content_security_policy: None,
+            strict_transport_security: None,
+            referrer_policy: Some("strict-origin-when-cross-origin".to_string()),
+            permissions_policy: None,
+        }
+    }
+}
+
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RateLimitConfig {

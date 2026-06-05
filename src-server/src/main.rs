@@ -8,6 +8,7 @@ mod metrics;
 mod handlers;
 mod logger;
 mod rate_limiter;
+mod security;
 
 use clap::Parser;
 use config::Config;
@@ -133,6 +134,14 @@ async fn main() {
     } else { 
         "Disabled".to_string() 
     });
+
+    println!(" Security Headers:");
+    println!("   - X-Frame-Options: {}", config.security.x_frame_options.as_deref().unwrap_or("Disabled"));
+    println!("   - X-Content-Type-Options: {}", if config.security.x_content_type_options { "Enabled" } else { "Disabled" });
+    println!("   - X-XSS-Protection: {}", if config.security.x_xss_protection { "Enabled" } else { "Disabled" });
+    println!("   - Content-Security-Policy: {}", if config.security.content_security_policy.is_some() { "Enabled" } else { "Disabled" });
+    println!("   - Referrer-Policy: {}", config.security.referrer_policy.as_deref().unwrap_or("Disabled"));
+    
 
     let pool_clone = state.pool.clone();
     let config_clone = state.config.clone();

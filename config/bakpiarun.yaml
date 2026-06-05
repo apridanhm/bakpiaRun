@@ -27,3 +27,25 @@ rate_limit:
   enabled: true
   requests_per_minute: 60
   burst_size: 10
+
+security:
+  # Prevent clickjacking (DENY, SAMEORIGIN, atau ALLOW-FROM uri)
+  x_frame_options: "DENY"
+  
+  # Prevent MIME type sniffing
+  x_content_type_options: true
+  
+  # Enable XSS filter
+  x_xss_protection: true
+  
+  # Content Security Policy (optional, uncomment to enable)
+  # content_security_policy: "default-src 'self'; script-src 'self' 'unsafe-inline'"
+  
+  # HTTP Strict Transport Security (optional, untuk HTTPS)
+  # strict_transport_security: "max-age=31536000; includeSubDomains"
+  
+  # Control referrer information
+  referrer_policy: "strict-origin-when-cross-origin"
+  
+  # Control browser features (optional)
+  # permissions_policy: "geolocation=(), microphone=(), camera=()"

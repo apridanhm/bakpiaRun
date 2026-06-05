@@ -11,6 +11,7 @@ use crate::types::{AppState, PhpRequest, FileInfo};
 use crate::ipc::send_to_php_worker;
 use crate::static_file;
 use crate::config::Config;
+use crate::security::apply_security_headers;
 
 pub async fn php_handler(
     method: Method,
@@ -315,6 +316,10 @@ pub async fn php_handler(
             let mut response = axum::http::Response::builder()
                 .status(StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK))
                 .header("Content-Type", "text/html; charset=utf-8");
+
+                let config = state.config.lock().await;
+                response = apply_security_headers(response, &config.security);
+                drop(config);
             
             if let Some(headers) = rate_limit_headers {
                 response = response
