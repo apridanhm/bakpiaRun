@@ -91,6 +91,7 @@ pub struct PhpConfig {
     pub memory_limit_mb: u64,
     pub max_requests: u64,
     pub timeout_ms: u64,
+    pub connection_pool_size: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]

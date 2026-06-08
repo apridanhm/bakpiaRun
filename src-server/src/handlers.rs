@@ -260,16 +260,23 @@ pub async fn php_handler(
         files,
     };
 
-    let socket_path = {
-        let pool = state.pool.lock().await;
-        pool.workers[worker_index].socket_path.clone()
-    };
-
     // WRAP DENGAN TIMEOUT
     let timeout_duration = std::time::Duration::from_millis(config.php.timeout_ms);
     
-    let result = tokio::time::timeout(timeout_duration, send_to_php_worker(&socket_path, request)).await;
-    
+    //let result = tokio::time::timeout(timeout_duration, send_to_php_worker(&socket_path, request)).await;
+    // ambil data worker dulu (socket_path, pool, pool_size)
+    let (socket_path, conn_pool, pool_size) = {
+        let pool = state.pool.lock().await;
+        let idx = pool.get_next_worker();
+        let w = &pool.workers[idx];
+        (w.socket_path.clone(), w.connection_pool.clone(), w.pool_size)
+    };
+
+    let result = tokio::time::timeout(
+        timeout_duration, 
+        send_to_php_worker(&socket_path, &conn_pool, pool_size, request)
+    ).await;
+
     match result {
         Ok(Ok(php_response)) => {
             // request sukses dalam timeout

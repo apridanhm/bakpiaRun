@@ -1,6 +1,9 @@
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, Duration};
 use crate::config::Config;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::net::UnixStream;
 
 pub struct Worker {
     pub index: usize,
@@ -9,10 +12,12 @@ pub struct Worker {
     pub requests_handled: u64,
     pub last_memory: u64,
     pub last_peak: u64,
+    pub connection_pool: Arc<Mutex<Vec<UnixStream>>>,
+    pub pool_size: usize,
 }
 
 impl Worker {
-    pub fn new(index: usize, socket_path: String) -> Self {
+    pub fn new(index: usize, socket_path: String, pool_size: usize) -> Self {
         Self {
             index,
             process: None,
@@ -20,6 +25,8 @@ impl Worker {
             requests_handled: 0,
             last_memory: 0,
             last_peak: 0,
+            connection_pool: Arc::new(Mutex::new(Vec::with_capacity(pool_size))),
+            pool_size,
         }
     }
 

@@ -13,7 +13,7 @@ impl WorkerPool {
 
         for i in 0..worker_count {
             let socket_path = config.get_worker_socket_path(i);
-            workers.push(Worker::new(i, socket_path));
+            workers.push(Worker::new(i, socket_path, config.php.connection_pool_size));
         }
 
         Self {
@@ -65,7 +65,7 @@ impl WorkerPool {
                 self.workers.clear();
                 for i in 0..new_count {
                     let socket_path = config.get_worker_socket_path(i);
-                    self.workers.push(Worker::new(i, socket_path));
+                    self.workers.push(Worker::new(i, socket_path, config.php.connection_pool_size));
                 }
             }
             

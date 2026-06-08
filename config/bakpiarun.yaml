@@ -10,10 +10,11 @@ server:
 php:
   docroot: "/home/bakpiarun-dev/bakpiarun/public"
   worker_path: "/home/bakpiarun-dev/bakpiarun/src-worker/worker.php"
-  worker_count: 8
+  worker_count: 32
   memory_limit_mb: 128
-  max_requests: 1000
+  max_requests: 5000
   timeout_ms: 30000
+  connection_pool_size: 5
 
 socket:
   directory: "/tmp/bakpiarun"
@@ -29,9 +30,9 @@ logging:
   file: "/home/bakpiarun-dev/bakpiarun/logs/bakpiarun.log"
 
 rate_limit:
-  enabled: true
-  requests_per_minute: 60
-  burst_size: 10
+  enabled: false
+  requests_per_minute: 120
+  burst_size: 20
 
 security:
   # Prevent clickjacking (DENY, SAMEORIGIN, atau ALLOW-FROM uri)
