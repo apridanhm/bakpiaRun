@@ -1,23 +1,37 @@
 # ==========================================
-# STAGE 1: COMPILE RUST (Build Environment)
+# STAGE 1: COMPILE RUST (Alpine Build)
 # ==========================================
-# PAKAI IMAGE DARI QUAY.IO (PUBLIC & FREE)
-FROM quay.io/rust-lang/rust:1.75.0 AS builder
+FROM rust:1.75-alpine3.19 AS builder
+
+# Install build dependencies (gcc, musl-dev, dll)
+RUN apk add --no-cache gcc musl-dev pkgconfig openssl-dev
 
 WORKDIR /app
 COPY . .
 
 # Compile release binary
-# Pastikan nama package sesuai Cargo.toml lu
+# Pastikan nama binary sesuai Cargo.toml lu
 RUN cargo build --release --target-dir /app/target
 
 # ==========================================
-# STAGE 2: RUNTIME (Production Image)
+# STAGE 2: RUNTIME (Alpine + PHP)
 # ==========================================
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+FROM alpine:3.19
 
-# Install PHP + MySQL client
-RUN microdnf install -y php php-pdo php-mysqlnd mysql && microdnf clean all
+# Install PHP + MySQL client + SSL libs (dibutuhkan runtime)
+RUN apk add --no-cache \
+    php82 \
+    php82-pdo \
+    php82-pdo_mysql \
+    php82-json \
+    php82-opcache \
+    mysql-client \
+    ca-certificates \
+    openssl \
+    tzdata
+
+# Set PHP config defaults (opsional)
+ENV PHP_INI_DIR=/etc/php82
 
 WORKDIR /app
 
@@ -29,7 +43,7 @@ COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# FIX OPENSHIFT SCC: Allow arbitrary user ID
+# FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
 RUN chgrp -R 0 /app && chmod -R g=u /app
 
 EXPOSE 8080
