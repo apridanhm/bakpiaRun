@@ -1,24 +1,18 @@
 # ==========================================
-# STAGE 1: COMPILE RUST (Build from src-server)
+# STAGE 1: COMPILE RUST
 # ==========================================
 FROM rust:1.75-alpine3.19 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache gcc musl-dev pkgconfig openssl-dev
 
-# COPY root Cargo files dulu (buat dependency resolution)
+# COPY SEMUA SEKALIGUS (biar nggak error pas build context)
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY . .
 
-# COPY folder src-server (tempat binary-nya)
-COPY src-server/ ./src-server/
-
-# BUILD langsung dari src-server directory
+# CD KE src-server (tempat Cargo.toml yang valid) & BUILD
 WORKDIR /app/src-server
 RUN cargo build --release --target-dir /app/target
-
-# COPY binary hasil compile
-COPY --from=builder /app/target/release/bakpiarun-server /app/bakpiarun-server
 
 # ==========================================
 # STAGE 2: RUNTIME (Alpine + PHP)
@@ -39,13 +33,13 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Copy application files
+# Copy application files (dari root repo)
 COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# Copy compiled binary from stage 1
-COPY --from=builder /app/bakpiarun-server /app/bakpiarun-server
+# COPY BINARY HASIL COMPILE (dari stage 1)
+COPY --from=builder /app/target/release/bakpiarun-server /app/bakpiarun-server
 
 # FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
 RUN chgrp -R 0 /app && chmod -R g=u /app
