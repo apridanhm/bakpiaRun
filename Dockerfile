@@ -51,6 +51,7 @@ COPY public/ /app/public/
 # FIX CONFIG: PAKAI printf (BUILDAAH COMPATIBLE!) 
 RUN printf '%s\n' \
   'server:' \
+  '  https_port: 8443' \
   '  host: "0.0.0.0"' \
   '  port: 8080' \
   '' \
