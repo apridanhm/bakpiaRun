@@ -1,35 +1,9 @@
 # ==========================================
-# STAGE 1: COMPILE RUST (Debian + musl target)
-# ==========================================
-FROM rust:latest AS rust-compile-stage
-
-# Install build dependencies untuk static linking
-RUN apt-get update && apt-get install -y \
-    gcc \
-    musl-tools \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Tambah target musl biar binary jadi static
-RUN rustup target add x86_64-unknown-linux-musl
-
-WORKDIR /app
-COPY . .
-
-# Hapus lock file lama biar nggak conflict versi
-RUN rm -f /app/src-server/Cargo.lock
-
-# Compile binary static
-WORKDIR /app/src-server
-RUN cargo build --release --target x86_64-unknown-linux-musl --target-dir /app/target
-
-# ==========================================
 # STAGE 2: RUNTIME (Alpine + PHP)
 # ==========================================
 FROM alpine:latest
 
-# Install PHP 8.3 + MySQL client
+# Install PHP + Symlink php83 ke php
 RUN apk add --no-cache \
     php83 \
     php83-pdo \
@@ -39,7 +13,8 @@ RUN apk add --no-cache \
     mysql-client \
     ca-certificates \
     openssl \
-    tzdata
+    tzdata \
+    && ln -s /usr/bin/php83 /usr/bin/php
 
 WORKDIR /app
 
@@ -48,9 +23,7 @@ COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-
-RUN mkdir -p /tmp/bakpiarun
-# FIX CONFIG: PAKAI printf (BUILDAAH COMPATIBLE!) 
+# (Bagian RUN printf config lu yang tadi, PASTE LAGI DI SINI BIAR AMAN)
 RUN printf '%s\n' \
   'server:' \
   '  host: "0.0.0.0"' \
@@ -101,8 +74,13 @@ RUN printf '%s\n' \
 # Copy binary static dari Stage 1
 COPY --from=rust-compile-stage /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
 
-#  FIX OPENSHIFT SCC: Izinkan arbitrary non-root UID
+# FIX OPENSHIFT SCC
 RUN chgrp -R 0 /app && chmod -R g=u /app
+
+# DEBUG: Cek file & php binary sebelum build selesai
+RUN ls -la /app/src-worker/ \
+    && ls -la /usr/bin/php \
+    && php -v
 
 EXPOSE 8080
 
