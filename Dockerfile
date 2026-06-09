@@ -10,6 +10,9 @@ RUN apk add --no-cache gcc musl-dev pkgconfig openssl-dev
 WORKDIR /app
 COPY . .
 
+
+RUN rm -f /app/src-server/Cargo.lock
+
 # CD KE src-server (tempat Cargo.toml yang valid) & BUILD
 WORKDIR /app/src-server
 RUN cargo build --release --target-dir /app/target
