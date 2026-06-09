@@ -48,38 +48,38 @@ COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# FIX BRUTAL: TIMPA TOTAL CONFIG FILE PAKAI PATH CONTAINER
-RUN cat > /app/config/bakpiarun.yaml << 'EOF'
-server:
-  host: "0.0.0.0"
-  port: 8080
-
-php:
-  docroot: "/app/public"
-  worker_path: "/app/src-worker/worker.php"
-  worker_count: 32
-  memory_limit_mb: 128
-  max_requests: 5000
-
-database:
-  host: "${DB_HOST}"
-  port: "${DB_PORT}"
-  user: "${DB_USER}"
-  password: "${DB_PASS}"
-  name: "${DB_NAME}"
-
-socket:
-  directory: "/tmp/bakpiarun"
-
-logging:
-  level: "info"
-  file: "/dev/stdout"
-EOF
+# FIX CONFIG: PAKAI printf (BUILDAAH COMPATIBLE!) 
+RUN printf '%s\n' \
+  'server:' \
+  '  host: "0.0.0.0"' \
+  '  port: 8080' \
+  '' \
+  'php:' \
+  '  docroot: "/app/public"' \
+  '  worker_path: "/app/src-worker/worker.php"' \
+  '  worker_count: 32' \
+  '  memory_limit_mb: 128' \
+  '  max_requests: 5000' \
+  '' \
+  'database:' \
+  '  host: "${DB_HOST}"' \
+  '  port: "${DB_PORT}"' \
+  '  user: "${DB_USER}"' \
+  '  password: "${DB_PASS}"' \
+  '  name: "${DB_NAME}"' \
+  '' \
+  'socket:' \
+  '  directory: "/tmp/bakpiarun"' \
+  '' \
+  'logging:' \
+  '  level: "info"' \
+  '  file: "/dev/stdout"' \
+  > /app/config/bakpiarun.yaml
 
 # Copy binary static dari Stage 1
 COPY --from=rust-compile-stage /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
 
-# FIX OPENSHIFT SCC: Izinkan arbitrary non-root UID
+#  FIX OPENSHIFT SCC: Izinkan arbitrary non-root UID
 RUN chgrp -R 0 /app && chmod -R g=u /app
 
 EXPOSE 8080
