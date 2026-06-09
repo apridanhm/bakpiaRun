@@ -9,12 +9,10 @@ RUN apk add --no-cache gcc musl-dev pkgconfig openssl-dev
 WORKDIR /app
 COPY . .
 
-# ✅ FIX 1: Build spesifik package "bakpiarun-server" dari workspace
-# Ganti "bakpiarun-server" dengan nama package yang ada di src-server/Cargo.toml
+# FIX: Build spesifik package "bakpiarun-server" dari workspace
 RUN cargo build --release --package bakpiarun-server --target-dir /app/target
 
-# ✅ FIX 2: Copy binary dengan nama yang sesuai
-# Cek nama binary di src-server/Cargo.toml -> [package] name = "..."
+# FIX: Copy binary dengan nama yang sesuai
 COPY --from=builder /app/target/release/bakpiarun-server /app/bakpiarun-server
 
 # ==========================================
@@ -41,10 +39,10 @@ COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# Copy binary yang sudah di-compile dari stage 1
+# Copy compiled binary from stage 1
 COPY --from=builder /app/bakpiarun-server /app/bakpiarun-server
 
-# 🔒 FIX OPENSHIFT SCC: Allow arbitrary user ID
+# FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
 RUN chgrp -R 0 /app && chmod -R g=u /app
 
 EXPOSE 8080
