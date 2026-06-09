@@ -3,7 +3,7 @@
 # ==========================================
 FROM rust:latest AS rust-compile-stage
 
-# Install musl tools buat compile static binary
+# Install build dependencies untuk static linking
 RUN apt-get update && apt-get install -y \
     gcc \
     musl-tools \
@@ -11,17 +11,16 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Set target musl & install rustup component
+# Tambah target musl biar binary jadi static
 RUN rustup target add x86_64-unknown-linux-musl
 
-# Copy semua file
 WORKDIR /app
 COPY . .
 
-# Hapus Cargo.lock yang mungkin incompatible
+# Hapus lock file lama biar nggak conflict versi
 RUN rm -f /app/src-server/Cargo.lock
 
-# BUILD DENGAN MUSL TARGET (static binary!)
+# Compile binary static
 WORKDIR /app/src-server
 RUN cargo build --release --target x86_64-unknown-linux-musl --target-dir /app/target
 
@@ -30,7 +29,7 @@ RUN cargo build --release --target x86_64-unknown-linux-musl --target-dir /app/t
 # ==========================================
 FROM alpine:latest
 
-# Install PHP + MySQL client + runtime deps
+# Install PHP 8.3 + MySQL client
 RUN apk add --no-cache \
     php83 \
     php83-pdo \
@@ -44,23 +43,45 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Copy application files
+# Copy asset aplikasi
 COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# FIX OTOMATIS PATH DI CONFIG FILE VIA SED
-# Ganti path hardcoded lokal developer jadi path container
-RUN sed -i 's|docroot:.*|docroot: "/app/public"|' /app/config/bakpiarun.yaml && \
-    sed -i 's|worker_path:.*|worker_path: "/app/src-worker/worker.php"|' /app/config/bakpiarun.yaml
+# FIX BRUTAL: TIMPA TOTAL CONFIG FILE PAKAI PATH CONTAINER
+RUN cat > /app/config/bakpiarun.yaml << 'EOF'
+server:
+  host: "0.0.0.0"
+  port: 8080
 
-# Copy compiled static binary dari stage 1
+php:
+  docroot: "/app/public"
+  worker_path: "/app/src-worker/worker.php"
+  worker_count: 32
+  memory_limit_mb: 128
+  max_requests: 5000
+
+database:
+  host: "${DB_HOST}"
+  port: "${DB_PORT}"
+  user: "${DB_USER}"
+  password: "${DB_PASS}"
+  name: "${DB_NAME}"
+
+socket:
+  directory: "/tmp/bakpiarun"
+
+logging:
+  level: "info"
+  file: "/dev/stdout"
+EOF
+
+# Copy binary static dari Stage 1
 COPY --from=rust-compile-stage /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
 
-# FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
+# FIX OPENSHIFT SCC: Izinkan arbitrary non-root UID
 RUN chgrp -R 0 /app && chmod -R g=u /app
 
 EXPOSE 8080
 
-# Run the server
 CMD ["/app/bakpiarun-server", "--config", "/app/config/bakpiarun.yaml"]
