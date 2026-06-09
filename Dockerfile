@@ -1,18 +1,23 @@
 # ==========================================
-# STAGE 1: COMPILE RUST (Alpine Build)
+# STAGE 1: COMPILE RUST (Build from src-server)
 # ==========================================
 FROM rust:1.75-alpine3.19 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache gcc musl-dev pkgconfig openssl-dev
 
+# COPY root Cargo files dulu (buat dependency resolution)
 WORKDIR /app
-COPY . .
+COPY Cargo.toml Cargo.lock ./
 
-# FIX: Build spesifik package "bakpiarun-server" dari workspace
-RUN cargo build --release --package bakpiarun-server --target-dir /app/target
+# COPY folder src-server (tempat binary-nya)
+COPY src-server/ ./src-server/
 
-# FIX: Copy binary dengan nama yang sesuai
+# BUILD langsung dari src-server directory
+WORKDIR /app/src-server
+RUN cargo build --release --target-dir /app/target
+
+# COPY binary hasil compile
 COPY --from=builder /app/target/release/bakpiarun-server /app/bakpiarun-server
 
 # ==========================================
