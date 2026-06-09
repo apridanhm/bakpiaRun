@@ -1,34 +1,34 @@
 # ==========================================
-# STAGE 1: COMPILE RUST
-# =========================================
-FROM rust:1.79-alpine3.20 AS builder
+# STAGE 1: COMPILE RUST (Latest Rust)
+# ==========================================
+FROM rust:latest-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache gcc musl-dev pkgconfig openssl-dev
 
-# COPY SEMUA SEKALIGUS (biar nggak error pas build context)
+# Copy semua file
 WORKDIR /app
 COPY . .
 
-
+# Hapus Cargo.lock yang mungkin incompatible
 RUN rm -f /app/src-server/Cargo.lock
 
-# CD KE src-server (tempat Cargo.toml yang valid) & BUILD
+# Build dari src-server
 WORKDIR /app/src-server
 RUN cargo build --release --target-dir /app/target
 
 # ==========================================
 # STAGE 2: RUNTIME (Alpine + PHP)
 # ==========================================
-FROM alpine:3.19
+FROM alpine:latest
 
 # Install PHP + MySQL client + runtime deps
 RUN apk add --no-cache \
-    php82 \
-    php82-pdo \
-    php82-pdo_mysql \
-    php82-json \
-    php82-opcache \
+    php83 \
+    php83-pdo \
+    php83-pdo_mysql \
+    php83-json \
+    php83-opcache \
     mysql-client \
     ca-certificates \
     openssl \
@@ -36,18 +36,17 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Copy application files (dari root repo)
+# Copy application files
 COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# COPY BINARY HASIL COMPILE (dari stage 1)
+# Copy compiled binary
 COPY --from=builder /app/target/release/bakpiarun-server /app/bakpiarun-server
 
-# FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
+# FIX OPENSHIFT SCC
 RUN chgrp -R 0 /app && chmod -R g=u /app
 
 EXPOSE 8080
 
-# Run the server
 CMD ["/app/bakpiarun-server", "--config", "/app/config/bakpiarun.yaml"]
