@@ -1,17 +1,25 @@
 # ==========================================
-# STAGE 0: COMPILE RUST (Latest + musl target)
+# STAGE 0: COMPILE RUST (Debian + rustup)
 # ==========================================
-FROM rust:latest-bookworm
+FROM debian:bookworm-slim
 
-# Install build dependencies untuk static linking
+# Install dependencies buat compile Rust + musl
 RUN apt-get update && apt-get install -y \
-    gcc \
-    musl-tools \
+    curl \
+    build-essential \
     pkg-config \
     libssl-dev \
+    musl-tools \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Tambah target musl biar binary jadi static
+# Install Rust via rustup (non-interactive)
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0 --profile minimal
+
+# Install musl target untuk static binary
 RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /app
