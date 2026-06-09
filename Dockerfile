@@ -1,7 +1,7 @@
 # ==========================================
-# STAGE 0: COMPILE RUST (Quay.io + musl target)
+# STAGE 0: COMPILE RUST (Latest + musl target)
 # ==========================================
-FROM rust:1.79-bookworm
+FROM rust:latest-bookworm
 
 # Install build dependencies untuk static linking
 RUN apt-get update && apt-get install -y \
