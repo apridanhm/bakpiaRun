@@ -1,7 +1,8 @@
 # ==========================================
 # STAGE 1: COMPILE RUST (Debian + musl target)
 # ==========================================
-FROM rust:latest AS builder
+# GANTI NAMA STAGE JADI LEBIH UNIK (biar Buildah nggak bingung)
+FROM rust:latest AS rust-compile-stage
 
 # Install musl tools buat compile static binary
 RUN apt-get update && apt-get install -y \
@@ -24,9 +25,6 @@ RUN rm -f /app/src-server/Cargo.lock
 # BUILD DENGAN MUSL TARGET (static binary!)
 WORKDIR /app/src-server
 RUN cargo build --release --target x86_64-unknown-linux-musl --target-dir /app/target
-
-# COPY BINARY DARI FOLDER musl-release
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
 
 # ==========================================
 # STAGE 2: RUNTIME (Alpine - Kecil & Cepat)
@@ -52,8 +50,9 @@ COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# Copy compiled static binary from stage 1
-COPY --from=builder /app/bakpiarun-server /app/bakpiarun-server
+# COPY BINARY: PAKAI NAMA STAGE YANG UNIK + NUMERIC FALLBACK
+COPY --from=rust-compile-stage /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
+# Alternatif kalau masih error: COPY --from=0 /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
 
 # FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
 RUN chgrp -R 0 /app && chmod -R g=u /app
