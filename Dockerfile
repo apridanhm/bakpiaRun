@@ -1,15 +1,18 @@
 # ==========================================
-# STAGE 1: COMPILE RUST (Debian-based, Latest)
+# STAGE 1: COMPILE RUST (Debian + musl target)
 # ==========================================
 FROM rust:latest AS builder
 
-# Install build dependencies (Debian)
+# Install musl tools buat compile static binary
 RUN apt-get update && apt-get install -y \
     gcc \
     musl-tools \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Set target musl & install rustup component
+RUN rustup target add x86_64-unknown-linux-musl
 
 # Copy semua file
 WORKDIR /app
@@ -18,9 +21,12 @@ COPY . .
 # Hapus Cargo.lock yang mungkin incompatible
 RUN rm -f /app/src-server/Cargo.lock
 
-# Build dari src-server
+# BUILD DENGAN MUSL TARGET (static binary!)
 WORKDIR /app/src-server
-RUN cargo build --release --target-dir /app/target
+RUN cargo build --release --target x86_64-unknown-linux-musl --target-dir /app/target
+
+# COPY BINARY DARI FOLDER musl-release
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
 
 # ==========================================
 # STAGE 2: RUNTIME (Alpine - Kecil & Cepat)
@@ -46,8 +52,8 @@ COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# Copy compiled binary dari stage 1 (Debian) ke stage 2 (Alpine)
-COPY --from=builder /app/target/release/bakpiarun-server /app/bakpiarun-server
+# Copy compiled static binary from stage 1
+COPY --from=builder /app/bakpiarun-server /app/bakpiarun-server
 
 # FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
 RUN chgrp -R 0 /app && chmod -R g=u /app
