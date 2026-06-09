@@ -1,7 +1,7 @@
 # ==========================================
-# STAGE 0: COMPILE RUST (Debian + musl target)
+# STAGE 0: COMPILE RUST (Quay.io + musl target)
 # ==========================================
-FROM rust:latest
+FROM rust:1.79-bookworm
 
 # Install build dependencies untuk static linking
 RUN apt-get update && apt-get install -y \
@@ -16,11 +16,8 @@ RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /app
 COPY . .
-
-# Hapus lock file lama biar nggak conflict versi
 RUN rm -f /app/src-server/Cargo.lock
 
-# Compile binary static
 WORKDIR /app/src-server
 RUN cargo build --release --target x86_64-unknown-linux-musl --target-dir /app/target
 
@@ -29,27 +26,16 @@ RUN cargo build --release --target x86_64-unknown-linux-musl --target-dir /app/t
 # ==========================================
 FROM alpine:latest
 
-# Install PHP + Symlink php83 ke php
 RUN apk add --no-cache \
-    php83 \
-    php83-pdo \
-    php83-pdo_mysql \
-    php83-json \
-    php83-opcache \
-    mysql-client \
-    ca-certificates \
-    openssl \
-    tzdata \
+    php83 php83-pdo php83-pdo_mysql php83-json php83-opcache \
+    mysql-client ca-certificates openssl tzdata \
     && ln -s /usr/bin/php83 /usr/bin/php
 
 WORKDIR /app
-
-# Copy asset aplikasi
 COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# CONFIG: PAKAI printf (BUILDAAH COMPATIBLE!)
 RUN printf '%s\n' \
   'server:' \
   '  host: "0.0.0.0"' \
@@ -97,17 +83,7 @@ RUN printf '%s\n' \
   '  level: 6' \
   > /app/config/bakpiarun.yaml
 
-# FIX: PAKAI NUMERIC REFERENCE (0 = stage pertama)
 COPY --from=0 /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
-
-# FIX OPENSHIFT SCC: Izinkan arbitrary non-root UID
 RUN chgrp -R 0 /app && chmod -R g=u /app
-
-# DEBUG: Cek file & php binary sebelum build selesai
-RUN ls -la /app/src-worker/ \
-    && ls -la /usr/bin/php \
-    && php -v
-
 EXPOSE 8080
-
 CMD ["/app/bakpiarun-server", "--config", "/app/config/bakpiarun.yaml"]

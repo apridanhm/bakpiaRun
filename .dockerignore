@@ -1,0 +1,44 @@
+# .dockerignore
+
+# Rust build artifacts (INI YANG BIKIN 3GB!)
+target/
+**/target/
+
+# Git & config
+.git/
+.gitignore
+.github/
+
+# Logs & certs (nggak perlu di-build)
+logs/
+certs/
+*.log
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Docker files (nggak perlu di-copy ke dalam image)
+Dockerfile
+.dockerignore
+
+# Config examples
+config/*.example.yaml
+config/*.bak
+
+# Tests & docs (nggak perlu di runtime image)
+tests/
+docs/
+*.md
+CHANGELOG.md
+
+# Scripts
+scripts/
+
+# Node modules (kalau ada front-end)
+node_modules/
+npm-debug.log
+yarn-error.log
