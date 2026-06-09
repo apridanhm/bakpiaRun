@@ -1,7 +1,7 @@
 # ==========================================
 # STAGE 1: COMPILE RUST
-# ==========================================
-FROM rust:1.75-alpine3.19 AS builder
+# =========================================
+FROM rust:1.79-alpine3.20 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache gcc musl-dev pkgconfig openssl-dev
