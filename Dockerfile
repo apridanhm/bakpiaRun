@@ -1,7 +1,7 @@
 # ==========================================
-# STAGE 0: COMPILE RUST (Debian + musl target)
+# STAGE 0: COMPILE RUST (Quay.io + musl target)
 # ==========================================
-FROM rust:latest
+FROM quay.io/rust-lang/rust:1.79.0
 
 # Install build dependencies untuk static linking
 RUN apt-get update && apt-get install -y \
@@ -100,10 +100,10 @@ RUN printf '%s\n' \
 # FIX: PAKAI NUMERIC REFERENCE (0 = stage pertama)
 COPY --from=0 /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
 
-#  FIX OPENSHIFT SCC: Izinkan arbitrary non-root UID
+# FIX OPENSHIFT SCC
 RUN chgrp -R 0 /app && chmod -R g=u /app
 
-# DEBUG: Cek file & php binary sebelum build selesai
+# DEBUG: Cek file & php binary
 RUN ls -la /app/src-worker/ \
     && ls -la /usr/bin/php \
     && php -v
