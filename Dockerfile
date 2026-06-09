@@ -48,6 +48,8 @@ COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
+
+RUN mkdir -p /tmp/bakpiarun
 # FIX CONFIG: PAKAI printf (BUILDAAH COMPATIBLE!) 
 RUN printf '%s\n' \
   'server:' \
