@@ -1,7 +1,6 @@
 # ==========================================
 # STAGE 1: COMPILE RUST (Debian + musl target)
 # ==========================================
-# GANTI NAMA STAGE JADI LEBIH UNIK (biar Buildah nggak bingung)
 FROM rust:latest AS rust-compile-stage
 
 # Install musl tools buat compile static binary
@@ -27,7 +26,7 @@ WORKDIR /app/src-server
 RUN cargo build --release --target x86_64-unknown-linux-musl --target-dir /app/target
 
 # ==========================================
-# STAGE 2: RUNTIME (Alpine - Kecil & Cepat)
+# STAGE 2: RUNTIME (Alpine + PHP)
 # ==========================================
 FROM alpine:latest
 
@@ -50,9 +49,13 @@ COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# COPY BINARY: PAKAI NAMA STAGE YANG UNIK + NUMERIC FALLBACK
+# FIX OTOMATIS PATH DI CONFIG FILE VIA SED
+# Ganti path hardcoded lokal developer jadi path container
+RUN sed -i 's|docroot:.*|docroot: "/app/public"|' /app/config/bakpiarun.yaml && \
+    sed -i 's|worker_path:.*|worker_path: "/app/src-worker/worker.php"|' /app/config/bakpiarun.yaml
+
+# Copy compiled static binary dari stage 1
 COPY --from=rust-compile-stage /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
-# Alternatif kalau masih error: COPY --from=0 /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server
 
 # FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
 RUN chgrp -R 0 /app && chmod -R g=u /app
