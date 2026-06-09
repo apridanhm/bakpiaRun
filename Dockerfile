@@ -35,8 +35,16 @@ RUN cargo build --release --target x86_64-unknown-linux-musl --target-dir /app/t
 FROM alpine:latest
 
 RUN apk add --no-cache \
-    php83 php83-pdo php83-pdo_mysql php83-json php83-opcache \
-    mysql-client ca-certificates openssl tzdata \
+    php83 \
+    php83-pcntl \
+    php83-pdo \
+    php83-pdo_mysql \
+    php83-json \
+    php83-opcache \
+    mysql-client \
+    ca-certificates \
+    openssl \
+    tzdata \
     && ln -s /usr/bin/php83 /usr/bin/php
 
 WORKDIR /app
