@@ -1,10 +1,15 @@
 # ==========================================
-# STAGE 1: COMPILE RUST (Latest Rust)
+# STAGE 1: COMPILE RUST (Debian-based, Latest)
 # ==========================================
-FROM rust:latest-alpine AS builder
+FROM rust:latest AS builder
 
-# Install build dependencies
-RUN apk add --no-cache gcc musl-dev pkgconfig openssl-dev
+# Install build dependencies (Debian)
+RUN apt-get update && apt-get install -y \
+    gcc \
+    musl-tools \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy semua file
 WORKDIR /app
@@ -18,7 +23,7 @@ WORKDIR /app/src-server
 RUN cargo build --release --target-dir /app/target
 
 # ==========================================
-# STAGE 2: RUNTIME (Alpine + PHP)
+# STAGE 2: RUNTIME (Alpine - Kecil & Cepat)
 # ==========================================
 FROM alpine:latest
 
@@ -41,12 +46,13 @@ COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# Copy compiled binary
+# Copy compiled binary dari stage 1 (Debian) ke stage 2 (Alpine)
 COPY --from=builder /app/target/release/bakpiarun-server /app/bakpiarun-server
 
-# FIX OPENSHIFT SCC
+# FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
 RUN chgrp -R 0 /app && chmod -R g=u /app
 
 EXPOSE 8080
 
+# Run the server
 CMD ["/app/bakpiarun-server", "--config", "/app/config/bakpiarun.yaml"]
