@@ -51,9 +51,13 @@ COPY public/ /app/public/
 # FIX CONFIG: PAKAI printf (BUILDAAH COMPATIBLE!) 
 RUN printf '%s\n' \
   'server:' \
-  '  https_port: 8443' \
   '  host: "0.0.0.0"' \
   '  port: 8080' \
+  '  https_port: 8443' \
+  '  tls:' \
+  '    enabled: false' \
+  '    cert_path: "/app/certs/cert.pem"' \
+  '    key_path: "/app/certs/key.pem"' \
   '' \
   'php:' \
   '  docroot: "/app/public"' \
@@ -61,20 +65,35 @@ RUN printf '%s\n' \
   '  worker_count: 32' \
   '  memory_limit_mb: 128' \
   '  max_requests: 5000' \
-  '' \
-  'database:' \
-  '  host: "${DB_HOST}"' \
-  '  port: "${DB_PORT}"' \
-  '  user: "${DB_USER}"' \
-  '  password: "${DB_PASS}"' \
-  '  name: "${DB_NAME}"' \
+  '  timeout_ms: 30000' \
+  '  connection_pool_size: 5' \
   '' \
   'socket:' \
   '  directory: "/tmp/bakpiarun"' \
   '' \
   'logging:' \
+  '  access_log_enabled: true' \
+  '  access_log: "/dev/stdout"' \
+  '  error_log_enabled: true' \
+  '  error_log: "/dev/stderr"' \
   '  level: "info"' \
   '  file: "/dev/stdout"' \
+  '' \
+  'rate_limit:' \
+  '  enabled: false' \
+  '  requests_per_minute: 120' \
+  '  burst_size: 20' \
+  '' \
+  'security:' \
+  '  x_frame_options: "DENY"' \
+  '  x_content_type_options: true' \
+  '  x_xss_protection: true' \
+  '  referrer_policy: "strict-origin-when-cross-origin"' \
+  '' \
+  'compression:' \
+  '  enabled: true' \
+  '  min_size_bytes: 1024' \
+  '  level: 6' \
   > /app/config/bakpiarun.yaml
 
 # Copy binary static dari Stage 1
