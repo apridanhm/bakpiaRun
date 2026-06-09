@@ -3,22 +3,26 @@
 # ==========================================
 FROM rust:1.75-alpine3.19 AS builder
 
-# Install build dependencies (gcc, musl-dev, dll)
+# Install build dependencies
 RUN apk add --no-cache gcc musl-dev pkgconfig openssl-dev
 
 WORKDIR /app
 COPY . .
 
-# Compile release binary
-# Pastikan nama binary sesuai Cargo.toml lu
-RUN cargo build --release --target-dir /app/target
+# ✅ FIX 1: Build spesifik package "bakpiarun-server" dari workspace
+# Ganti "bakpiarun-server" dengan nama package yang ada di src-server/Cargo.toml
+RUN cargo build --release --package bakpiarun-server --target-dir /app/target
+
+# ✅ FIX 2: Copy binary dengan nama yang sesuai
+# Cek nama binary di src-server/Cargo.toml -> [package] name = "..."
+COPY --from=builder /app/target/release/bakpiarun-server /app/bakpiarun-server
 
 # ==========================================
 # STAGE 2: RUNTIME (Alpine + PHP)
 # ==========================================
 FROM alpine:3.19
 
-# Install PHP + MySQL client + SSL libs (dibutuhkan runtime)
+# Install PHP + MySQL client + runtime deps
 RUN apk add --no-cache \
     php82 \
     php82-pdo \
@@ -30,20 +34,17 @@ RUN apk add --no-cache \
     openssl \
     tzdata
 
-# Set PHP config defaults (opsional)
-ENV PHP_INI_DIR=/etc/php82
-
 WORKDIR /app
-
-# Copy compiled binary dari stage 1
-COPY --from=builder /app/target/release/bakpiarun-server /app/bakpiarun-server
 
 # Copy application files
 COPY config/ /app/config/
 COPY src-worker/ /app/src-worker/
 COPY public/ /app/public/
 
-# FIX OPENSHIFT SCC: Allow arbitrary user ID (WAJIB!)
+# Copy binary yang sudah di-compile dari stage 1
+COPY --from=builder /app/bakpiarun-server /app/bakpiarun-server
+
+# 🔒 FIX OPENSHIFT SCC: Allow arbitrary user ID
 RUN chgrp -R 0 /app && chmod -R g=u /app
 
 EXPOSE 8080
