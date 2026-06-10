@@ -60,3 +60,23 @@ compression:
   enabled: true
   min_size_bytes: 1024  # Hanya compress response > 1KB
   level: 6  # 1-9 (6 = balanced)
+
+pools:
+  - name: "fast"
+    worker_count: 32
+    memory_limit_mb: 128
+    max_requests: 5000
+    timeout_ms: 30000
+    patterns:
+      - "/*"
+  
+  - name: "heavy"
+    worker_count: 8
+    memory_limit_mb: 512
+    max_requests: 100
+    timeout_ms: 300000
+    patterns:
+      - "/heavy-*"
+      - "/api/export/*"
+      - "/api/report/*"
+      - "/admin/bulk-*"
