@@ -62,21 +62,23 @@ compression:
   level: 6  # 1-9 (6 = balanced)
 
 pools:
-  - name: "fast"
-    worker_count: 32
-    memory_limit_mb: 128
-    max_requests: 5000
-    timeout_ms: 30000
-    patterns:
-      - "/*"
-  
+  # HEAVY POOL DULU (lebih spesifik)
   - name: "heavy"
     worker_count: 8
     memory_limit_mb: 512
     max_requests: 100
     timeout_ms: 300000
     patterns:
+      - "/heavy-db.php"
       - "/heavy-*"
       - "/api/export/*"
       - "/api/report/*"
-      - "/admin/bulk-*"
+  
+  # FAST POOL TERAKHIR (catch all)
+  - name: "fast"
+    worker_count: 32
+    memory_limit_mb: 128
+    max_requests: 5000
+    timeout_ms: 30000
+    patterns:
+      - "/*"  # Default: semua request yang gak match heavy
