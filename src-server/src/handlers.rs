@@ -63,12 +63,11 @@ pub async fn php_handler(
         None
     };
 
-    
     // LOCK CONFIG
     let config = state.config.lock().await.clone();
-    
     let path = uri.path();
 
+    // STATIC FILE CHECK
     if static_file::is_static_file(path) {
         println!("[Static] Serving: {}", path);
         state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 200, 0);
@@ -76,10 +75,7 @@ pub async fn php_handler(
     }
     
     let file_path = match static_file::find_php_file(&config.php.docroot, path).await {
-        Some(fp) => {
-            println!("[Router] {} → {}", path, fp);
-            fp
-        }
+        Some(fp) => fp,
         None => {
             println!("[404] Not found: {}", path);
             let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -90,18 +86,42 @@ pub async fn php_handler(
                 .unwrap();
         }
     };
-    
+
+    // 🎯 ROUTING: Pilih pool berdasarkan URL pattern
+    let pool_name = {
+        let pm = state.pool_manager.lock().await;
+        match pm.get_pool_name_for_path(path) {
+            Some(name) => name,
+            None => {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                state.logger.log_error("ERROR", &format!("No suitable pool for path: {} (URI: {})", path, uri));
+                state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Html("<h1>500 Error</h1><p>No suitable worker pool found</p>"),
+                ).into_response();
+            }
+        }
+    };
+    println!("[Router] {} → Pool: {}", path, pool_name);
+
+    // Ambil worker dari pool yang dipilih
     let worker_index = {
-        let pool = state.pool.lock().await;
+        let pm = state.pool_manager.lock().await;
+        let pool_arc = pm.get_pool(&pool_name).unwrap();
+        let pool = pool_arc.lock().await;
         pool.get_next_worker()
     };
 
+    // Ensure worker running
     {
-        let mut pool = state.pool.lock().await;
+        let pm = state.pool_manager.lock().await;
+        let pool_arc = pm.get_pool(&pool_name).unwrap();
+        let mut pool = pool_arc.lock().await;
         if let Some(worker) = pool.workers.get_mut(worker_index) {
             if let Err(e) = worker.ensure_running(&config).await {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
-                state.logger.log_error("ERROR", &format!("Worker #{} failed to start: {} (URI: {})", worker_index, e, uri));
+                state.logger.log_error("ERROR", &format!("Worker #{} in pool '{}' failed to start: {} (URI: {})", worker_index, pool_name, e, uri));
                 state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -111,6 +131,7 @@ pub async fn php_handler(
         }
     }
 
+    // Parse headers, cookies, body (BIARKAN SAMA)
     let mut header_map = HashMap::new();
     for (key, value) in headers.iter() {
         if let Ok(v) = value.to_str() {
@@ -176,7 +197,6 @@ pub async fn php_handler(
                     if let Some(fname) = filename {
                         let upload_dir = "/tmp/bakpiarun_uploads/";
                         let _ = std::fs::create_dir_all(upload_dir);
-                        
                         let temp_path = format!("{}{}", upload_dir, format!("{}", uuid::Uuid::new_v4()));
                         
                         match std::fs::File::create(&temp_path) {
@@ -260,18 +280,17 @@ pub async fn php_handler(
         files,
     };
 
-    // WRAP DENGAN TIMEOUT
-    let timeout_duration = std::time::Duration::from_millis(config.php.timeout_ms);
-    
-    //let result = tokio::time::timeout(timeout_duration, send_to_php_worker(&socket_path, request)).await;
-    // ambil data worker dulu (socket_path, pool, pool_size)
+    // 🎯 AMBIL socket_path, conn_pool, pool_size DARI POOL YANG DIPILIH
     let (socket_path, conn_pool, pool_size) = {
-        let pool = state.pool.lock().await;
-        let idx = pool.get_next_worker();
-        let w = &pool.workers[idx];
+        let pm = state.pool_manager.lock().await;
+        let pool_arc = pm.get_pool(&pool_name).unwrap();
+        let pool = pool_arc.lock().await;
+        let w = &pool.workers[worker_index];
         (w.socket_path.clone(), w.connection_pool.clone(), w.pool_size)
     };
 
+    // WRAP DENGAN TIMEOUT
+    let timeout_duration = std::time::Duration::from_millis(config.php.timeout_ms);
     let result = tokio::time::timeout(
         timeout_duration, 
         send_to_php_worker(&socket_path, &conn_pool, pool_size, request)
@@ -279,7 +298,6 @@ pub async fn php_handler(
 
     match result {
         Ok(Ok(php_response)) => {
-            // request sukses dalam timeout
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_access(
                 &client_ip,
@@ -294,12 +312,16 @@ pub async fn php_handler(
                 metrics.record_request(worker_index, php_response.memory);
             }
 
+            // 🎯 UPDATE stats worker di pool yang dipilih
             let restart_reason = {
-                let mut pool = state.pool.lock().await;
+                let pm = state.pool_manager.lock().await;
+                let pool_arc = pm.get_pool(&pool_name).unwrap();
+                let mut pool = pool_arc.lock().await;
                 if let Some(worker) = pool.workers.get_mut(worker_index) {
                     worker.update_stats(php_response.memory, php_response.peak);
                     println!(
-                        "[Worker #{}] Request #{} handled. Memory: {} MB, Peak: {} MB",
+                        "[Pool:{}] Worker #{} Request #{} handled. Memory: {} MB, Peak: {} MB",
+                        pool_name,
                         worker_index,
                         worker.requests_handled,
                         php_response.memory / 1024 / 1024,
@@ -313,8 +335,10 @@ pub async fn php_handler(
 
             if let Some(reason) = restart_reason {
                 println!("[Anti-OOM] {}", reason);
-                println!("[Anti-OOM] Restarting worker #{}...", worker_index);
-                let mut pool = state.pool.lock().await;
+                println!("[Anti-OOM] Restarting worker #{} in pool '{}'...", worker_index, pool_name);
+                let pm = state.pool_manager.lock().await;
+                let pool_arc = pm.get_pool(&pool_name).unwrap();
+                let mut pool = pool_arc.lock().await;
                 if let Some(worker) = pool.workers.get_mut(worker_index) {
                     worker.stop().await;
                 }
@@ -324,9 +348,9 @@ pub async fn php_handler(
                 .status(StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK))
                 .header("Content-Type", "text/html; charset=utf-8");
 
-                let config = state.config.lock().await;
-                response = apply_security_headers(response, &config.security);
-                drop(config);
+            let config = state.config.lock().await;
+            response = apply_security_headers(response, &config.security);
+            drop(config);
             
             if let Some(headers) = rate_limit_headers {
                 response = response
@@ -341,11 +365,10 @@ pub async fn php_handler(
                 .into_response()
         }
         Ok(Err(e)) => {
-            // worker error (bukan timeout)
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_error(
                 "ERROR",
-                &format!("Worker #{} failed: {} (URI: {})", worker_index, e, uri),
+                &format!("Worker #{} in pool '{}' failed: {} (URI: {})", worker_index, pool_name, e, uri),
             );
             state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
 
@@ -353,9 +376,11 @@ pub async fn php_handler(
                 let mut metrics = state.metrics.lock().await;
                 metrics.record_error();
             }
-            eprintln!("[Worker #{}] Error: {}", worker_index, e);
+            eprintln!("[Pool:{}] Worker #{} Error: {}", pool_name, worker_index, e);
             {
-                let mut pool = state.pool.lock().await;
+                let pm = state.pool_manager.lock().await;
+                let pool_arc = pm.get_pool(&pool_name).unwrap();
+                let mut pool = pool_arc.lock().await;
                 if let Some(worker) = pool.workers.get_mut(worker_index) {
                     let _ = worker.ensure_running(&config).await;
                 }
@@ -366,7 +391,6 @@ pub async fn php_handler(
             ).into_response()
         }
         Err(_) => {
-            // TIMEOUT EXCEEDED
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_error(
                 "ERROR",
@@ -379,11 +403,12 @@ pub async fn php_handler(
                 metrics.record_error();
             }
             
-            // restart worker karena mungkin hang
             {
-                let mut pool = state.pool.lock().await;
+                let pm = state.pool_manager.lock().await;
+                let pool_arc = pm.get_pool(&pool_name).unwrap();
+                let mut pool = pool_arc.lock().await;
                 if let Some(worker) = pool.workers.get_mut(worker_index) {
-                    println!("[Timeout] Restarting worker #{}...", worker_index);
+                    println!("[Timeout] Restarting worker #{} in pool '{}'...", worker_index, pool_name);
                     worker.stop().await;
                 }
             }
@@ -400,27 +425,42 @@ pub async fn php_handler(
 }
 
 pub async fn health_handler(State(state): State<AppState>) -> Response {
-    let pool = state.pool.lock().await;
+    let pm = state.pool_manager.lock().await;
     let metrics = state.metrics.lock().await;
     
+    let mut total_workers = 0;
     let mut workers_healthy = 0;
-    let mut workers_info = Vec::new();
+    let mut all_pools_info = Vec::new();
     
-    for worker in &pool.workers {
-        let is_alive = worker.process.is_some();
-        if is_alive {
-            workers_healthy += 1;
+    for (pool_name, pool_arc) in &pm.pools {
+        let pool = pool_arc.lock().await;
+        let mut pool_healthy = 0;
+        let mut pool_workers_info = Vec::new();
+        
+        for worker in &pool.workers {
+            let is_alive = worker.process.is_some();
+            if is_alive {
+                workers_healthy += 1;
+                pool_healthy += 1;
+            }
+            total_workers += 1;
+            
+            pool_workers_info.push(serde_json::json!({
+                "index": worker.index,
+                "alive": is_alive,
+                "requests": worker.requests_handled,
+                "memory_mb": worker.last_memory / 1024 / 1024,
+            }));
         }
         
-        workers_info.push(serde_json::json!({
-            "index": worker.index,
-            "alive": is_alive,
-            "requests": worker.requests_handled,
-            "memory_mb": worker.last_memory / 1024 / 1024,
+        all_pools_info.push(serde_json::json!({
+            "name": pool_name,
+            "total": pool.workers.len(),
+            "healthy": pool_healthy,
+            "workers": pool_workers_info,
         }));
     }
     
-    let total_workers = pool.workers.len();
     let is_healthy = workers_healthy == total_workers;
     
     let response = serde_json::json!({
@@ -428,10 +468,10 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         "uptime_seconds": metrics.uptime_seconds(),
         "total_requests": metrics.total_requests,
         "total_errors": metrics.total_errors,
+        "pools": all_pools_info,
         "workers": {
             "total": total_workers,
             "healthy": workers_healthy,
-            "details": workers_info,
         }
     });
     
@@ -445,7 +485,7 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
 }
 
 pub async fn metrics_handler(State(state): State<AppState>) -> Response {
-    let pool = state.pool.lock().await;
+    let pm = state.pool_manager.lock().await;
     let metrics = state.metrics.lock().await;
     
     let mut output = String::new();
@@ -478,9 +518,15 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response {
     
     output.push_str("# HELP bakpiarun_worker_alive Worker alive status\n");
     output.push_str("# TYPE bakpiarun_worker_alive gauge\n");
-    for worker in &pool.workers {
-        let alive = if worker.process.is_some() { 1 } else { 0 };
-        output.push_str(&format!("bakpiarun_worker_alive{{worker=\"{}\"}} {}\n", worker.index, alive));
+    for (pool_name, pool_arc) in &pm.pools {
+        let pool = pool_arc.lock().await;
+        for worker in &pool.workers {
+            let alive = if worker.process.is_some() { 1 } else { 0 };
+            output.push_str(&format!(
+                "bakpiarun_worker_alive{{pool=\"{}\",worker=\"{}\"}} {}\n",
+                pool_name, worker.index, alive
+            ));
+        }
     }
     
     (
@@ -490,13 +536,12 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response {
     ).into_response()
 }
 
-// reload handler
 pub async fn reload_handler(State(state): State<AppState>) -> Response {
     println!("[Reload] HTTP reload triggered");
     
     let config_path = std::env::current_dir()
-    .map(|p| p.join("../config/bakpiarun.yaml").to_string_lossy().to_string())
-    .unwrap_or_else(|_| "../config/bakpiarun.yaml".to_string()); // suapaya configurable
+        .map(|p| p.join("../config/bakpiarun.yaml").to_string_lossy().to_string())
+        .unwrap_or_else(|_| "../config/bakpiarun.yaml".to_string());
     
     let mut new_config = match Config::load_from_file(&config_path) {
         Ok(c) => c,
@@ -527,37 +572,36 @@ pub async fn reload_handler(State(state): State<AppState>) -> Response {
         ).into_response();
     }
     
-    // update shared config
     {
         let mut config = state.config.lock().await;
         *config = new_config.clone();
     }
     
-    // rolling restart workers
-    let mut pool = state.pool.lock().await;
-    match pool.reload(&new_config).await {
-        Ok(_) => {
-            let response = serde_json::json!({
-                "status": "success",
-                "message": "Configuration reloaded successfully",
-                "workers": new_config.php.worker_count
-            });
-            (
-                StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                Body::from(serde_json::to_string_pretty(&response).unwrap()),
-            ).into_response()
-        }
-        Err(e) => {
-            let response = serde_json::json!({
-                "status": "error",
-                "message": format!("Failed to reload workers: {}", e)
-            });
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                Body::from(serde_json::to_string_pretty(&response).unwrap()),
-            ).into_response()
+    // 🎯 Reload semua pools
+    let pm = state.pool_manager.lock().await;
+    let mut reload_results = Vec::new();
+    
+    for (name, pool_arc) in &pm.pools {
+        println!("[Reload] Reloading pool '{}'...", name);
+        let mut pool = pool_arc.lock().await;
+        match pool.reload(&new_config).await {
+            Ok(_) => reload_results.push(format!("Pool '{}': OK", name)),
+            Err(e) => {
+                eprintln!("[Reload] Failed to reload pool '{}': {}", name, e);
+                reload_results.push(format!("Pool '{}': FAILED - {}", name, e));
+            }
         }
     }
+    
+    let response = serde_json::json!({
+        "status": "success",
+        "message": "Configuration reloaded successfully",
+        "pools": reload_results
+    });
+    
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        Body::from(serde_json::to_string_pretty(&response).unwrap()),
+    ).into_response()
 }

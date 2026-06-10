@@ -40,13 +40,6 @@ impl WorkerPool {
         index % self.workers.len()
     }
 
-    pub async fn ensure_all_running(&mut self, config: &Config) {
-        for worker in &mut self.workers {
-            if let Err(e) = worker.ensure_running(config).await {
-                eprintln!("[Supervisor] Failed to restart worker #{}: {}", worker.index, e);
-            }
-        }
-    }
 
         // rolling restart untuk graceful reload
         pub async fn reload(&mut self, config: &Config) -> Result<(), String> {

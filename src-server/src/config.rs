@@ -19,9 +19,9 @@ pub struct Config {
 pub struct PoolConfig {
     pub name: String,
     pub worker_count: usize,
-    pub memory_limit_mb: u64,
-    pub max_requests: u64,
-    pub timeout_ms: u64,
+    //pub memory_limit_mb: u64,
+    //pub max_requests: u64,
+    //pub timeout_ms: u64,
     #[serde(default)]
     pub patterns: Vec<String>,
 }

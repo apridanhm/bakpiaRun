@@ -4,10 +4,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::worker_pool::WorkerPool;
 use crate::metrics::Metrics;
 use crate::logger::Logger;
 use crate::rate_limiter::RateLimiter;
+use crate::pool_manager::PoolManager;
 
 #[derive(Debug, Serialize)]
 pub struct PhpRequest {
@@ -44,9 +44,8 @@ pub struct PhpResponse {
 
 #[derive(Clone)]
 pub struct AppState {
-    //pub config: Arc<Config>,
     pub config: Arc<Mutex<Config>>,
-    pub pool: Arc<Mutex<WorkerPool>>,
+    pub pool_manager: Arc<Mutex<PoolManager>>,
     pub metrics: Arc<Mutex<Metrics>>,
     pub logger: Arc<Logger>,
     pub rate_limiter: Arc<RateLimiter>,
