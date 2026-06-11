@@ -9,11 +9,11 @@ mod handlers;
 mod logger;
 mod rate_limiter;
 mod security;
+mod pool_manager; 
 
 use clap::Parser;
 use config::Config;
 use types::AppState;
-use worker_pool::WorkerPool;
 use metrics::Metrics;
 use handlers::{php_handler, health_handler, metrics_handler, reload_handler};
 use logger::Logger;
@@ -22,9 +22,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use axum::routing::get;
 use axum::Router;
-use tokio::time::{sleep, Duration};
 use rate_limiter::RateLimiter;
 use tower_http::compression::CompressionLayer;
+use pool_manager::PoolManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "bakpiarun", about = "PHP Runtime Server")]
@@ -66,12 +66,16 @@ async fn main() {
     std::fs::create_dir_all(&config.socket.directory)
         .expect("Failed to create socket directory");
 
-    let mut pool = WorkerPool::new(config.php.worker_count, &config);
+    /*let mut pool = WorkerPool::new(config.php.worker_count, &config);
 
     if let Err(e) = pool.start_all(&config).await {
         eprintln!(" Failed to start workers: {}", e);
         std::process::exit(1);
-    }
+    }*/
+    // Initialize Pool Manager
+    println!(" Initializing Pool Manager...");
+    let pool_manager = PoolManager::new(&config).await;
+    let pool_manager = Arc::new(tokio::sync::Mutex::new(pool_manager));
 
     let metrics = Metrics::new(config.php.worker_count);
 
@@ -90,8 +94,9 @@ async fn main() {
 
     let state = AppState {
         //config: Arc::new(config.clone()),
-        config: Arc::new(Mutex::new(config.clone())),
-        pool: Arc::new(Mutex::new(pool)),
+        config: Arc::new(tokio::sync::Mutex::new(config.clone())),
+        //pool: Arc::new(Mutex::new(pool)),
+        pool_manager: pool_manager.clone(),
         metrics: Arc::new(Mutex::new(metrics)),
         logger: Arc::new(logger),
         rate_limiter: Arc::new(rate_limiter),
@@ -167,15 +172,13 @@ async fn main() {
     }
     
 
-    let pool_clone = state.pool.clone();
-    let config_clone = state.config.clone();
+    let pool_manager_for_shutdown = state.pool_manager.clone();
     tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(5)).await;
-            let mut pool = pool_clone.lock().await;
-            let config = config_clone.lock().await;
-            pool.ensure_all_running(&config).await;
-        }
+        tokio::signal::ctrl_c().await.unwrap();
+        println!("\n[Server] Shutting down gracefully...");
+        let pm = pool_manager_for_shutdown.lock().await;
+        pm.stop_all().await;
+        std::process::exit(0);
     });
 
     // graceful reload
@@ -213,20 +216,24 @@ async fn main() {
                 *config = new_config.clone();
             }
             
-            // rolling restart workers
-            let mut pool = state_for_reload.pool.lock().await;
-            if let Err(e) = pool.reload(&new_config).await {
-                eprintln!("[Reload] Failed to reload workers: {}", e);
+            // rolling restart all pools
+            let pm = state_for_reload.pool_manager.lock().await;
+            for (name, pool_arc) in &pm.pools {
+                println!("[Reload] Reloading pool '{}'...", name);
+                let mut pool = pool_arc.lock().await;
+                if let Err(e) = pool.reload(&new_config).await {
+                    eprintln!("[Reload] Failed to reload pool '{}': {}", name, e);
+                }
             }
         }
     });
 
-    let state_for_shutdown = state.clone();
+    let pool_manager_for_shutdown = state.pool_manager.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.unwrap();
         println!("\n[Server] Shutting down gracefully...");
-        let mut pool = state_for_shutdown.pool.lock().await;
-        pool.stop_all().await;
+        let pm = pool_manager_for_shutdown.lock().await;  // ← LOCK DULU
+        pm.stop_all().await;
         std::process::exit(0);
     });
 
