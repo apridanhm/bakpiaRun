@@ -124,7 +124,7 @@ E-commerce Website:
 - PHP 8.0+ (CLI mode)
 - Linux/macOS (Unix Domain Socket support)
 
-###
+### Project Structure
 ```code
 bakpiarun/
 ├── src-server/          # Rust backend server
