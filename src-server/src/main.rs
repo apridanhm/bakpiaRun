@@ -10,6 +10,8 @@ mod logger;
 mod rate_limiter;
 mod security;
 mod pool_manager; 
+mod queue;
+use queue::JobQueue;
 
 use clap::Parser;
 use config::Config;
@@ -25,6 +27,8 @@ use axum::Router;
 use rate_limiter::RateLimiter;
 use tower_http::compression::CompressionLayer;
 use pool_manager::PoolManager;
+use std::time::Duration;
+use axum::routing::post;
 
 #[derive(Parser, Debug)]
 #[command(name = "bakpiarun", about = "PHP Runtime Server")]
@@ -92,6 +96,10 @@ async fn main() {
         config.rate_limit.burst_size,
     );
 
+    // Initialize Job Queue
+    let job_queue = Arc::new(JobQueue::new());
+    println!(" Queue System initialized");
+
     let state = AppState {
         //config: Arc::new(config.clone()),
         config: Arc::new(tokio::sync::Mutex::new(config.clone())),
@@ -100,6 +108,7 @@ async fn main() {
         metrics: Arc::new(Mutex::new(metrics)),
         logger: Arc::new(logger),
         rate_limiter: Arc::new(rate_limiter),
+        queue: job_queue.clone(), 
     };
 
     let app = Router::new()
@@ -108,6 +117,8 @@ async fn main() {
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/reload", get(reload_handler))
+        .route("/api/queue/submit", post(handlers::submit_job))
+        .route("/api/queue/status/:id", get(handlers::get_job_status))
         .with_state(state.clone());
 
     // compression mmiddleware
@@ -264,6 +275,29 @@ async fn main() {
         });
     }
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    // Start Background Queue Worker
+    let queue_worker = job_queue.clone();
+    tokio::spawn(async move {
+        println!("[Queue Worker] Background worker started!");
+        loop {
+            // Cek antrian setiap 500ms
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            
+            if let Some(job_id) = queue_worker.dequeue().await {
+                println!("[Queue Worker] Processing job: {}", job_id);
+                queue_worker.mark_processing(&job_id).await;
+                
+                // Simulasi proses berat (nanti bisa diganti eksekusi PHP)
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                
+                // Tandai selesai
+                queue_worker.mark_completed(
+                    &job_id, 
+                    serde_json::json!({"message": "Task processed successfully"})
+                ).await;
+            }
+        }
+    });
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>()
