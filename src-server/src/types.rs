@@ -50,5 +50,6 @@ pub struct AppState {
     pub metrics: Arc<Mutex<Metrics>>,
     pub logger: Arc<Logger>,
     pub rate_limiter: Arc<RateLimiter>,
-    pub queue: Arc<JobQueue>,
+    //pub queue: Arc<JobQueue>,
+    pub queue: Option<Arc<JobQueue>>, 
 }

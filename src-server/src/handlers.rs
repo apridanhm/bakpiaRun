@@ -629,14 +629,27 @@ pub async fn reload_handler(State(state): State<AppState>) -> Response {
 pub async fn submit_job(
     State(state): State<AppState>,
     Json(req): Json<SubmitJobRequest>,
-) -> Json<JobResponse> {
-    let job_id = state.queue.submit(req.task, req.payload).await;
+) -> Response {
+    // Check if queue is enabled
+    let queue = match &state.queue {
+        Some(q) => q,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Queue system is disabled"
+                })),
+            ).into_response();
+        }
+    };
+    
+    let job_id = queue.submit(req.task, req.payload).await;
     
     Json(JobResponse {
         job_id,
         status: "pending".to_string(),
         message: "Job successfully queued".to_string(),
-    })
+    }).into_response()
 }
 
 // Endpoint untuk cek status job
@@ -644,7 +657,20 @@ pub async fn get_job_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.queue.get_status(&id).await {
+    // Check if queue is enabled
+    let queue = match &state.queue {
+        Some(q) => q,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Queue system is disabled"
+                })),
+            ).into_response();
+        }
+    };
+    
+    match queue.get_status(&id).await {
         Some(job) => Json(job).into_response(),
         None => (
             StatusCode::NOT_FOUND,

@@ -82,3 +82,10 @@ pools:
     timeout_ms: 30000
     patterns:
       - "/*"  # Default: semua request yang gak match heavy
+
+
+# Queue System Configuration
+queue:
+  enabled: false        # Set to false to disable queue system
+  max_jobs: 10000      # Maximum jobs in queue (prevent memory overflow)
+

@@ -13,6 +13,7 @@ pub struct Config {
     pub security: SecurityConfig,
     pub compression: CompressionConfig,
     pub pools: Vec<PoolConfig>,
+    pub queue: QueueConfig, 
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -25,6 +26,23 @@ pub struct PoolConfig {
     #[serde(default)]
     pub patterns: Vec<String>,
 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct QueueConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_queue_max_jobs")]
+    pub max_jobs: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_queue_max_jobs() -> usize {
+    10000
+}
+
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SecurityConfig {
