@@ -4,6 +4,10 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
 };
+use axum::extract::Path;
+use axum::Json;
+use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -12,6 +16,21 @@ use crate::ipc::send_to_php_worker;
 use crate::static_file;
 use crate::config::Config;
 use crate::security::apply_security_headers;
+
+
+#[derive(Deserialize)]
+pub struct SubmitJobRequest {
+    pub task: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Serialize)]
+pub struct JobResponse {
+    pub job_id: String,
+    pub status: String,
+    pub message: String,
+}
+
 
 pub async fn php_handler(
     method: Method,
@@ -280,7 +299,7 @@ pub async fn php_handler(
         files,
     };
 
-    // 🎯 AMBIL socket_path, conn_pool, pool_size DARI POOL YANG DIPILIH
+    // AMBIL socket_path, conn_pool, pool_size DARI POOL YANG DIPILIH
     let (socket_path, conn_pool, pool_size) = {
         let pm = state.pool_manager.lock().await;
         let pool_arc = pm.get_pool(&pool_name).unwrap();
@@ -312,7 +331,7 @@ pub async fn php_handler(
                 metrics.record_request(worker_index, php_response.memory);
             }
 
-            // 🎯 UPDATE stats worker di pool yang dipilih
+            // UPDATE stats worker di pool yang dipilih
             let restart_reason = {
                 let pm = state.pool_manager.lock().await;
                 let pool_arc = pm.get_pool(&pool_name).unwrap();
@@ -577,7 +596,7 @@ pub async fn reload_handler(State(state): State<AppState>) -> Response {
         *config = new_config.clone();
     }
     
-    // 🎯 Reload semua pools
+    // reload semua pools
     let pm = state.pool_manager.lock().await;
     let mut reload_results = Vec::new();
     
@@ -604,4 +623,60 @@ pub async fn reload_handler(State(state): State<AppState>) -> Response {
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         Body::from(serde_json::to_string_pretty(&response).unwrap()),
     ).into_response()
+}
+
+// Endpoint untuk submit job baru
+pub async fn submit_job(
+    State(state): State<AppState>,
+    Json(req): Json<SubmitJobRequest>,
+) -> Response {
+    // Check if queue is enabled
+    let queue = match &state.queue {
+        Some(q) => q,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Queue system is disabled"
+                })),
+            ).into_response();
+        }
+    };
+    
+    let job_id = queue.submit(req.task, req.payload).await;
+    
+    Json(JobResponse {
+        job_id,
+        status: "pending".to_string(),
+        message: "Job successfully queued".to_string(),
+    }).into_response()
+}
+
+// Endpoint untuk cek status job
+pub async fn get_job_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    // Check if queue is enabled
+    let queue = match &state.queue {
+        Some(q) => q,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Queue system is disabled"
+                })),
+            ).into_response();
+        }
+    };
+    
+    match queue.get_status(&id).await {
+        Some(job) => Json(job).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Job not found"
+            })),
+        ).into_response(),
+    }
 }
