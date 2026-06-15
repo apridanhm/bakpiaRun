@@ -11,8 +11,8 @@ mod rate_limiter;
 mod security;
 mod pool_manager; 
 mod queue;
-use queue::JobQueue;
 
+use queue::JobQueue;
 use clap::Parser;
 use config::Config;
 use types::AppState;
