@@ -9,9 +9,9 @@ pub async fn admin_auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Get expected token from environment
+    // Get token from environment variable
     let expected_token = std::env::var("BAKPIA_ADMIN_TOKEN")
-        .unwrap_or_else(|_| String::new());
+        .unwrap_or_default();
     
     // If no token configured, skip auth (for development)
     if expected_token.is_empty() {

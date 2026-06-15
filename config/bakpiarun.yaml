@@ -2,6 +2,7 @@ server:
   host: "0.0.0.0"
   port: 8080
   https_port: 8443
+  admin_token: "dev-token-for-local-testing"
   tls:
     enabled: true
     cert_path: "/home/bakpiarun-dev/bakpiarun/certs/cert.pem"
@@ -88,4 +89,6 @@ pools:
 queue:
   enabled: false        # Set to false to disable queue system
   max_jobs: 10000      # Maximum jobs in queue (prevent memory overflow)
+
+
 

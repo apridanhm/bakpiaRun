@@ -111,6 +111,7 @@ pub struct ServerConfig {
     pub port: u16,
     pub https_port: u16,
     pub tls: TlsConfig,
+    pub admin_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
