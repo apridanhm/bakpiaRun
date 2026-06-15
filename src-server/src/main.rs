@@ -12,6 +12,7 @@ mod security;
 mod pool_manager; 
 mod queue;
 mod job_handlers;
+mod middleware;
 
 use queue::JobQueue;
 use job_handlers::HandlerRegistry;
@@ -30,6 +31,8 @@ use rate_limiter::RateLimiter;
 use tower_http::compression::CompressionLayer;
 use pool_manager::PoolManager;
 use std::time::Duration;
+use middleware::admin_auth::admin_auth_middleware;
+use axum::middleware as axum_middleware;
 
 #[derive(Parser, Debug)]
 #[command(name = "bakpiarun", about = "PHP Runtime Server")]
@@ -121,22 +124,45 @@ async fn main() {
     };
 
     // Build Router
+    //let mut app = Router::new()
+    //    .route("/", get(php_handler).post(php_handler))
+    //    .route("/*path", get(php_handler).post(php_handler))
+    //    .route("/health", get(health_handler))
+    //    .route("/metrics", get(metrics_handler))
+    //    .route("/reload", get(reload_handler));
+
+    // Build Router
     let mut app = Router::new()
         .route("/", get(php_handler).post(php_handler))
-        .route("/*path", get(php_handler).post(php_handler))
-        .route("/health", get(health_handler))
-        .route("/metrics", get(metrics_handler))
-        .route("/reload", get(reload_handler));
+        .route("/*path", get(php_handler).post(php_handler));
 
-    // Add queue routes ONLY if enabled
+    // Add admin routes with authentication
     if config.queue.enabled {
-        app = app
+        // Queue routes + admin routes with auth
+        let admin_routes = Router::new()
+            .route("/health", get(health_handler))
+            .route("/metrics", get(metrics_handler))
+            .route("/reload", get(reload_handler))
             .route("/api/queue/submit", post(handlers::submit_job))
-            .route("/api/queue/status/:id", get(handlers::get_job_status));
-        println!("Queue API routes registered");
+            .route("/api/queue/status/:id", get(handlers::get_job_status))
+            //.layer(middleware::from_fn(admin_auth_middleware));
+            .layer(axum_middleware::from_fn(admin_auth_middleware));
+        
+        app = app.merge(admin_routes);
+        println!("Queue API routes registered WITH authentication");
     } else {
+        // Admin routes only (queue disabled)
+        let admin_routes = Router::new()
+            .route("/health", get(health_handler))
+            .route("/metrics", get(metrics_handler))
+            .route("/reload", get(reload_handler))
+            //.layer(middleware::from_fn(admin_auth_middleware));
+            .layer(axum_middleware::from_fn(admin_auth_middleware));
+        app = app.merge(admin_routes);
         println!("Queue API routes DISABLED");
     }
+
+    let app = app.with_state(state.clone());
 
     let app = app.with_state(state.clone());
 
