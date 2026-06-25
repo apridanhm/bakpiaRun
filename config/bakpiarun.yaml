@@ -90,5 +90,19 @@ queue:
   enabled: false        # Set to false to disable queue system
   max_jobs: 10000      # Maximum jobs in queue (prevent memory overflow)
 
-
-
+# DB PROXY & CONNECTION POOLING
+db_proxy:
+  enabled: true
+  listen_address: "127.0.0.1"
+  listen_port: 3307
+  
+  target:
+    host: "127.0.0.1"       # Ganti ke IP DB asli lo
+    port: 3306
+    username: "bakpiarun_user"        # Username ASLI DB lo
+    password: "password_asli_lo" # Password ASLI DB lo
+    database: "bakpiarun_db"
+    
+  pool:
+    min_connections: 2
+    max_connections: 20

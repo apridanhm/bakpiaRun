@@ -13,6 +13,7 @@ mod pool_manager;
 mod queue;
 mod job_handlers;
 mod middleware;
+mod db_proxy;
 
 use queue::JobQueue;
 use job_handlers::HandlerRegistry;
@@ -122,6 +123,17 @@ async fn main() {
     } else {
         None
     };
+
+
+    // Initialize Secure DB Proxy (Fase 2)
+    if config.db_proxy.enabled {
+        let db_config = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db_proxy::DbProxy::start(&db_config).await {
+                eprintln!("❌ DB Proxy failed to start: {}", e);
+            }
+        });
+    }
 
     let state = AppState {
         config: Arc::new(Mutex::new(config.clone())),

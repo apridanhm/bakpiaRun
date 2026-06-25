@@ -13,7 +13,8 @@ pub struct Config {
     pub security: SecurityConfig,
     pub compression: CompressionConfig,
     pub pools: Vec<PoolConfig>,
-    pub queue: QueueConfig, 
+    pub queue: QueueConfig,
+    pub db_proxy: DbProxyConfig, 
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -223,3 +224,39 @@ impl Config {
 
 
 }
+
+
+// DB PROXY CONFIGURATION
+#[derive(Debug, Deserialize, Clone)]
+pub struct DbProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_listen_address")]
+    pub listen_address: String,
+    #[serde(default = "default_db_proxy_port")]
+    pub listen_port: u16,
+    pub target: DbTargetConfig,
+    pub pool: DbPoolConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DbTargetConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub database: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DbPoolConfig {
+    #[serde(default = "default_min_conn")]
+    pub min_connections: usize,
+    #[serde(default = "default_max_conn")]
+    pub max_connections: usize,
+}
+
+fn default_listen_address() -> String { "127.0.0.1".to_string() }
+fn default_db_proxy_port() -> u16 { 3307 }
+fn default_min_conn() -> usize { 2 }
+fn default_max_conn() -> usize { 20 }
