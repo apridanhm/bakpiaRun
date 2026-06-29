@@ -95,12 +95,13 @@ db_proxy:
   enabled: true
   listen_address: "127.0.0.1"
   listen_port: 3307
+  spoof_version: "8.0.33-bakpiarun-proxy" # Fallback kalau DB asli gak bisa dibaca
   
   target:
-    host: "127.0.0.1"       # Ganti ke IP DB asli lo
+    host: "127.0.0.1"
     port: 3306
-    username: "bakpiarun_user"        # Username ASLI DB lo
-    password: "password_asli_lo" # Password ASLI DB lo
+    username: "bakpiarun_user"
+    password: "password_asli_lo"
     database: "bakpiarun_db"
     
   pool:

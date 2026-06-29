@@ -228,6 +228,7 @@ impl Config {
 
 // DB PROXY CONFIGURATION
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct DbProxyConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -235,6 +236,11 @@ pub struct DbProxyConfig {
     pub listen_address: String,
     #[serde(default = "default_db_proxy_port")]
     pub listen_port: u16,
+    
+    // INI JADI FALLBACK KALAU GAK BISA BACA DARI DB ASLI
+    #[serde(default = "default_spoof_version")]
+    pub spoof_version: String,
+    
     pub target: DbTargetConfig,
     pub pool: DbPoolConfig,
 }
@@ -249,6 +255,7 @@ pub struct DbTargetConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct DbPoolConfig {
     #[serde(default = "default_min_conn")]
     pub min_connections: usize,
@@ -258,5 +265,6 @@ pub struct DbPoolConfig {
 
 fn default_listen_address() -> String { "127.0.0.1".to_string() }
 fn default_db_proxy_port() -> u16 { 3307 }
+fn default_spoof_version() -> String { "8.0.33-bakpiarun-proxy".to_string() }
 fn default_min_conn() -> usize { 2 }
 fn default_max_conn() -> usize { 20 }

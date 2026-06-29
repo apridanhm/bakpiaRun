@@ -27,3 +27,4 @@ http-body-util = "0.1"
 tower = { version = "0.5.3", features = ["full"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 mysql_async = "0.33"
+mysql_common = "0.30"
