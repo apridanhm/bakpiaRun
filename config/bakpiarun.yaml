@@ -90,5 +90,20 @@ queue:
   enabled: false        # Set to false to disable queue system
   max_jobs: 10000      # Maximum jobs in queue (prevent memory overflow)
 
-
-
+# DB PROXY & CONNECTION POOLING
+db_proxy:
+  enabled: true
+  listen_address: "127.0.0.1"
+  listen_port: 3307
+  spoof_version: "8.0.33-bakpiarun-proxy" # Fallback kalau DB asli gak bisa dibaca
+  
+  target:
+    host: "127.0.0.1"
+    port: 3306
+    username: "bakpiarun_user"
+    password: "password_asli_lo"
+    database: "bakpiarun_db"
+    
+  pool:
+    min_connections: 2
+    max_connections: 20
