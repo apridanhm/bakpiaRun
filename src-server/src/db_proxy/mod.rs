@@ -132,7 +132,7 @@ impl DbProxy {
                     Self::handle_com_query(socket, seq_id, &payload, &pool).await?;
                 }
                 0x09 => {
-                    Self::handle_com_stmt_prepare(socket, seq_id, &payload, &pool, &conn_state).await?;
+                    Self::handle_com_stmt_prepare(socket, seq_id, &payload, &conn_state).await?;
                 }
                 0x17 => {
                     Self::handle_com_stmt_execute(socket, seq_id, &payload, &pool, &conn_state).await?;
@@ -228,62 +228,51 @@ impl DbProxy {
         socket: &mut tokio::net::TcpStream,
         seq_id: u8,
         payload: &[u8],
-        pool: &Pool,
         conn_state: &Arc<Mutex<ConnectionState>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let query = String::from_utf8_lossy(&payload[1..]).to_string();
-        println!("🔧 [COM_STMT_PREPARE]: {}", query);
+        println!("[COM_STMT_PREPARE]: {}", query);
 
-        match pool.get_conn().await {
-            Ok(mut conn) => {
-                match conn.exec_iter(query.as_str(), mysql_async::Params::Empty).await {
-                    Ok(result) => {
-                        let mut state = conn_state.lock().await;
-                        let stmt_id = state.next_stmt_id;
-                        state.next_stmt_id += 1;
-                        state.statements.insert(stmt_id, query.clone());
+        let mut state = conn_state.lock().await;
+        let stmt_id = state.next_stmt_id;
+        state.next_stmt_id += 1;
+        state.statements.insert(stmt_id, query.clone());
 
-                        let columns = result.columns().expect("Columns missing");
-                        let num_columns = columns.len() as u32;
-                        let num_params = query.matches('?').count() as u32;
+        let num_params = query.matches('?').count() as u16;
+        let num_columns: u16 = 0;
 
-                        let mut current_seq = seq_id + 1;
-                        let prepare_ok = Self::build_stmt_prepare_ok_packet(current_seq, stmt_id, num_columns, num_params);
-                        
-                        println!("COM_STMT_PREPARE response: {} bytes", prepare_ok.len());
-                        socket.write_all(&prepare_ok).await?;
-                        current_seq += 1;
+        let mut current_seq = seq_id + 1;
+        
+        // Build STMT_PREPARE_OK packet (12 bytes payload)
+        let mut prepare_ok = Vec::new();
+        prepare_ok.push(0x00); // Status OK
+        prepare_ok.extend_from_slice(&stmt_id.to_le_bytes()); // 4 bytes
+        prepare_ok.extend_from_slice(&num_columns.to_le_bytes()); // 2 bytes
+        prepare_ok.extend_from_slice(&num_params.to_le_bytes()); // 2 bytes
+        prepare_ok.push(0x00); // Reserved
+        prepare_ok.extend_from_slice(&[0x00, 0x00]); // Warning count
+        
+        let packet = Self::build_packet(current_seq, &prepare_ok);
+        println!("COM_STMT_PREPARE response: {} bytes (payload: {} bytes)", packet.len(), prepare_ok.len());
+        
+        socket.write_all(&packet).await?;
+        current_seq += 1;
 
-                        if num_params > 0 {
-                            for i in 0..num_params {
-                                socket.write_all(&Self::build_stmt_param_def_packet(current_seq, i)).await?;
-                                current_seq += 1;
-                            }
-                            socket.write_all(&Self::build_eof_packet(current_seq)).await?;
-                            current_seq += 1;
-                        }
-
-                        if num_columns > 0 {
-                            for col in columns.iter() {
-                                let name = col.name_str().to_string();
-                                let col_type = col.column_type();
-                                socket.write_all(&Self::build_column_def_packet(current_seq, &name, col_type)).await?;
-                                current_seq += 1;
-                            }
-                            socket.write_all(&Self::build_eof_packet(current_seq)).await?;
-                        }
-
-                        println!("Prepared statement {} created (cols: {}, params: {})", stmt_id, num_columns, num_params);
-                    }
-                    Err(e) => {
-                        socket.write_all(&Self::build_error_packet(seq_id + 1, 1105, &format!("{}", e))).await?;
-                    }
-                }
+        // Send parameter definitions (if any)
+        if num_params > 0 {
+            for i in 0..num_params {
+                socket.write_all(&Self::build_stmt_param_def_packet(current_seq, i as u32)).await?;
+                current_seq += 1;
             }
-            Err(e) => {
-                socket.write_all(&Self::build_error_packet(seq_id + 1, 1105, &format!("{}", e))).await?;
-            }
+            socket.write_all(&Self::build_eof_packet(current_seq)).await?;
+            current_seq += 1;
         }
+
+        // Send EOF for columns (num_columns = 0)
+        socket.write_all(&Self::build_eof_packet(current_seq)).await?;
+
+        println!("Prepared statement {} created (params: {})", stmt_id, num_params);
+        
         socket.flush().await?;
         Ok(())
     }
@@ -313,13 +302,20 @@ impl DbProxy {
                 return Ok(());
             }
         };
+        let num_params = query.matches('?').count();
         drop(state);
 
-        let params = Self::parse_stmt_execute_params(&payload[5..])?;
+        // Parse binary parameters
+        let params = Self::parse_binary_parameters_safe(&payload[5..], num_params);
+        
+        // Substitute parameters into query
+        let final_query = Self::substitute_parameters(&query, &params);
+        println!("[EXECUTED AS]: {}", final_query);
 
+        // Execute as COM_QUERY
         match pool.get_conn().await {
             Ok(mut conn) => {
-                match conn.exec_iter(query.as_str(), params).await {
+                match conn.query_iter(final_query.as_str()).await {
                     Ok(mut result) => {
                         let mut current_seq = seq_id + 1;
                         let columns = result.columns().expect("Columns missing");
@@ -379,11 +375,132 @@ impl DbProxy {
         Ok(())
     }
 
-    fn parse_stmt_execute_params(payload: &[u8]) -> Result<mysql_async::Params, Box<dyn std::error::Error>> {
-        if payload.is_empty() {
-            return Ok(mysql_async::Params::Empty);
+    fn parse_binary_parameters_safe(payload: &[u8], num_params: usize) -> Vec<String> {
+        if num_params == 0 || payload.len() < 6 {
+            return vec![];
         }
-        Ok(mysql_async::Params::Empty)
+
+        let mut params = Vec::new();
+        let mut offset = 5;
+
+        let bitmap_len = (num_params + 7) / 8;
+        if payload.len() < offset + bitmap_len {
+            return vec!["NULL".to_string(); num_params];
+        }
+        let null_bitmap = &payload[offset..offset + bitmap_len];
+        offset += bitmap_len;
+
+        if payload.len() <= offset {
+            return vec!["NULL".to_string(); num_params];
+        }
+        let new_params_bound = payload[offset] == 1;
+        offset += 1;
+
+        let mut types = vec![0xfd; num_params];
+        if new_params_bound && payload.len() >= offset + num_params * 2 {
+            for i in 0..num_params {
+                types[i] = payload[offset + i * 2];
+            }
+            offset += num_params * 2;
+        }
+
+        for i in 0..num_params {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            if null_bitmap[byte_idx] & (1 << bit_idx) != 0 {
+                params.push("NULL".to_string());
+                continue;
+            }
+
+            if offset >= payload.len() {
+                params.push("NULL".to_string());
+                continue;
+            }
+
+            let param_type = types[i];
+            match param_type {
+                0x01 => {
+                    if offset < payload.len() {
+                        let val = payload[offset] as i8;
+                        params.push(val.to_string());
+                        offset += 1;
+                    } else {
+                        params.push("NULL".to_string());
+                    }
+                }
+                0x02 | 0x03 => {
+                    if offset + 4 <= payload.len() {
+                        let val = i32::from_le_bytes([
+                            payload[offset],
+                            payload[offset + 1],
+                            payload[offset + 2],
+                            payload[offset + 3],
+                        ]);
+                        params.push(val.to_string());
+                        offset += 4;
+                    } else {
+                        params.push("NULL".to_string());
+                    }
+                }
+                0x08 => {
+                    if offset + 8 <= payload.len() {
+                        let val = i64::from_le_bytes([
+                            payload[offset],
+                            payload[offset + 1],
+                            payload[offset + 2],
+                            payload[offset + 3],
+                            payload[offset + 4],
+                            payload[offset + 5],
+                            payload[offset + 6],
+                            payload[offset + 7],
+                        ]);
+                        params.push(val.to_string());
+                        offset += 8;
+                    } else {
+                        params.push("NULL".to_string());
+                    }
+                }
+                _ => {
+                    let (val, new_offset) = Self::read_lenenc_string_safe(&payload[offset..]);
+                    params.push(format!("'{}'", val.replace("'", "''")));
+                    offset = new_offset;
+                }
+            }
+        }
+
+        params
+    }
+
+    fn read_lenenc_string_safe(data: &[u8]) -> (String, usize) {
+        if data.is_empty() {
+            return ("".to_string(), 0);
+        }
+
+        let first_byte = data[0];
+        let (len, offset) = if first_byte < 251 {
+            (first_byte as usize, 1)
+        } else if first_byte == 0xfc && data.len() >= 3 {
+            ((data[1] as usize) | ((data[2] as usize) << 8), 3)
+        } else if first_byte == 0xfd && data.len() >= 4 {
+            ((data[1] as usize) | ((data[2] as usize) << 8) | ((data[3] as usize) << 16), 4)
+        } else {
+            return ("".to_string(), 0);
+        };
+
+        if data.len() < offset + len {
+            return ("".to_string(), data.len());
+        }
+
+        let val = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
+        (val, offset + len)
+    }
+
+    fn substitute_parameters(query: &str, params: &[String]) -> String {
+        let mut result = query.to_string();
+        for param in params {
+            result = result.replacen('?', param, 1);
+        }
+        result
     }
 
     fn generate_scramble() -> Vec<u8> {
@@ -516,18 +633,6 @@ impl DbProxy {
                 _ => payload.extend_from_slice(&Self::lenenc_str(b"?")),
             }
         }
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn build_stmt_prepare_ok_packet(seq_id: u8, stmt_id: u32, num_columns: u32, num_params: u32) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.push(0x00); // Status OK
-        payload.extend_from_slice(&stmt_id.to_le_bytes()); // 4 bytes
-        payload.extend_from_slice(&(num_columns as u16).to_le_bytes()); // 2 bytes
-        payload.extend_from_slice(&(num_params as u16).to_le_bytes()); // 2 bytes
-        payload.push(0x00); // Reserved
-        payload.extend_from_slice(&[0x00, 0x00]); // Warning count
-        // Total: 1 + 4 + 2 + 2 + 1 + 2 = 12 bytes
         Self::build_packet(seq_id, &payload)
     }
 
