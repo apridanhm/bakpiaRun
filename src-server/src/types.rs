@@ -41,6 +41,10 @@ pub struct PhpResponse {
     pub body: String,
     pub memory: u64,
     pub peak: u64,
+    /// Raw response headers emitted by PHP (`header()` / `setcookie()`),
+    /// each formatted as `"Name: value"`. Includes any `Set-Cookie` lines.
+    #[serde(default)]
+    pub headers: Vec<String>,
 }
 
 #[derive(Clone)]

@@ -25,17 +25,22 @@ pub struct Job {
 pub struct JobQueue {
     pub jobs: Arc<RwLock<HashMap<String, Job>>>,
     pub queue: Arc<Mutex<VecDeque<String>>>, // Menyimpan ID job yang pending
+    max_jobs: usize,
 }
 
 impl JobQueue {
-    pub fn new() -> Self {
+    pub fn new(max_jobs: usize) -> Self {
         Self {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             queue: Arc::new(Mutex::new(VecDeque::new())),
+            max_jobs,
         }
     }
 
-    pub async fn submit(&self, task: String, payload: serde_json::Value) -> String {
+    /// Submit a job. Returns `None` when the queue is full of in-flight work
+    /// (so the caller can return 503). Finished jobs are reaped on demand to
+    /// make room and to bound memory.
+    pub async fn submit(&self, task: String, payload: serde_json::Value) -> Option<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -50,15 +55,34 @@ impl JobQueue {
         };
 
         let task_name = job.task.clone();
-        let mut jobs = self.jobs.write().await; 
+        let mut jobs = self.jobs.write().await;
+
+        if jobs.len() >= self.max_jobs {
+            // Reclaim space by dropping completed/failed jobs.
+            let finished: Vec<String> = jobs
+                .iter()
+                .filter(|(_, j)| matches!(j.status, JobStatus::Completed | JobStatus::Failed(_)))
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            if finished.is_empty() {
+                println!("[Queue] REJECTED: queue full ({} in-flight jobs)", jobs.len());
+                return None;
+            }
+
+            for fid in finished {
+                jobs.remove(&fid);
+            }
+        }
+
         jobs.insert(id.clone(), job);
         drop(jobs);
-        
+
         let mut queue = self.queue.lock().await;
         queue.push_back(id.clone());
-        
+
         println!("[Queue] Job submitted: {} (Task: {})", id, task_name);
-        id
+        Some(id)
     }
 
     pub async fn get_status(&self, id: &str) -> Option<Job> {

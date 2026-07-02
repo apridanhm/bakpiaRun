@@ -1,0 +1,4 @@
+# TLS certificates live here but are intentionally NOT committed.
+# Generate a self-signed dev certificate with:
+#   openssl req -x509 -newkey rsa:4096 -nodes \
+#     -keyout certs/key.pem -out certs/cert.pem -days 365 -subj "/CN=localhost"

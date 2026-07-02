@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::config::Config;
+use crate::config::{Config, PoolConfig};
 use crate::worker_pool::WorkerPool;
 
 pub struct PoolManager {
@@ -14,26 +14,54 @@ impl PoolManager {
         let mut pools = HashMap::new();
         let mut routing_table = Vec::new();
 
-        // Pastikan ada minimal 1 pool di config
-        if config.pools.is_empty() {
-            eprintln!("[PoolManager] WARNING: No pools defined in config! Using default.");
-        }
+        // Fall back to a single catch-all pool when none are configured, so the
+        // server is usable with a minimal config (and never has zero pools).
+        let default_pools;
+        let pool_configs: &[PoolConfig] = if config.pools.is_empty() {
+            eprintln!("[PoolManager] No pools defined in config; creating a default catch-all pool.");
+            default_pools = vec![PoolConfig {
+                name: "default".to_string(),
+                worker_count: config.php.worker_count,
+                memory_limit_mb: None,
+                max_requests: None,
+                timeout_ms: None,
+                patterns: vec!["/*".to_string()],
+            }];
+            &default_pools
+        } else {
+            &config.pools
+        };
 
-        for pool_config in &config.pools {
-            println!("[PoolManager] Initializing pool '{}' with {} workers...", 
+        for pool_config in pool_configs {
+            println!("[PoolManager] Initializing pool '{}' with {} workers...",
                      pool_config.name, pool_config.worker_count);
-            
+
             // Create pool-specific socket directory
             let pool_socket_dir = format!("{}/{}", config.socket.directory, pool_config.name);
             std::fs::create_dir_all(&pool_socket_dir)
                 .expect(&format!("Failed to create socket directory for pool '{}'", pool_config.name));
-            
+
             // Create pool-specific config
             let mut pool_specific_config = config.clone();
             pool_specific_config.socket.directory = pool_socket_dir;
-            
-            let mut pool = WorkerPool::new(pool_config.worker_count, &pool_specific_config);
-        
+
+            // Resolve effective limits: per-pool override, else global default.
+            let memory_limit_mb = pool_config.memory_limit_mb.unwrap_or(config.php.memory_limit_mb);
+            let max_requests = pool_config.max_requests.unwrap_or(config.php.max_requests);
+            let timeout_ms = pool_config.timeout_ms.unwrap_or(config.php.timeout_ms);
+            println!(
+                "[PoolManager] Pool '{}' limits: memory={}MB, max_requests={}, timeout={}ms",
+                pool_config.name, memory_limit_mb, max_requests, timeout_ms
+            );
+
+            let pool = WorkerPool::new(
+                pool_config.worker_count,
+                &pool_specific_config,
+                memory_limit_mb,
+                max_requests,
+                timeout_ms,
+            );
+
             // Start workers untuk pool ini
             if let Err(e) = pool.start_all(&pool_specific_config).await {
                 eprintln!("[PoolManager] Failed to start pool '{}': {}", pool_config.name, e);
@@ -93,7 +121,7 @@ impl PoolManager {
         println!("[PoolManager] Stopping all pools...");
         for (name, pool) in &self.pools {
             println!("[PoolManager] Stopping pool '{}'...", name);
-            let mut pool = pool.lock().await;
+            let pool = pool.lock().await;
             pool.stop_all().await;
         }
         println!("[PoolManager] All pools stopped.");

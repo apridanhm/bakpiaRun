@@ -12,17 +12,23 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     pub security: SecurityConfig,
     pub compression: CompressionConfig,
+    #[serde(default)]
     pub pools: Vec<PoolConfig>,
-    pub queue: QueueConfig, 
+    #[serde(default)]
+    pub queue: QueueConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PoolConfig {
     pub name: String,
     pub worker_count: usize,
-    //pub memory_limit_mb: u64,
-    //pub max_requests: u64,
-    //pub timeout_ms: u64,
+    /// Per-pool overrides. When absent, the global `php.*` value is used.
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+    #[serde(default)]
+    pub max_requests: Option<u64>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub patterns: Vec<String>,
 }
@@ -41,6 +47,17 @@ fn default_true() -> bool {
 
 fn default_queue_max_jobs() -> usize {
     10000
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        // When the `queue:` section is omitted entirely, keep the queue OFF so
+        // the background worker isn't started unexpectedly.
+        Self {
+            enabled: false,
+            max_jobs: default_queue_max_jobs(),
+        }
+    }
 }
 
 

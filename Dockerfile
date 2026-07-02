@@ -97,6 +97,16 @@ RUN printf '%s\n' \
   '  enabled: true' \
   '  min_size_bytes: 1024' \
   '  level: 6' \
+  '' \
+  'pools:' \
+  '  - name: "fast"' \
+  '    worker_count: 32' \
+  '    patterns:' \
+  '      - "/*"' \
+  '' \
+  'queue:' \
+  '  enabled: false' \
+  '  max_jobs: 10000' \
   > /app/config/bakpiarun.yaml
 
 COPY --from=0 /app/target/x86_64-unknown-linux-musl/release/bakpiarun-server /app/bakpiarun-server

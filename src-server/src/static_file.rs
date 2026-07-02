@@ -3,8 +3,44 @@ use axum::{
     http::{header, StatusCode},
     response::Response,
 };
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tokio::fs;
+
+/// Reject request sub-paths that could escape the document root.
+///
+/// The sub-path must be relative and must not contain any `..` (ParentDir)
+/// component, an absolute-path root, or a Windows prefix. Note this operates on
+/// the raw (percent-encoded) request path: encoded sequences like `%2e%2e` are
+/// treated as ordinary name characters and simply won't resolve on disk.
+pub fn is_safe_subpath(subpath: &str) -> bool {
+    let p = Path::new(subpath);
+    if p.is_absolute() {
+        return false;
+    }
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+            Component::Normal(_) | Component::CurDir => {}
+        }
+    }
+    true
+}
+
+/// Resolve `candidate` and confirm it is a regular file located inside
+/// `docroot` after canonicalization (which also collapses symlinks). Returns
+/// the canonical path only when it is safely contained in the document root.
+async fn resolve_within(docroot: &str, candidate: &Path) -> Option<PathBuf> {
+    if !candidate.is_file() {
+        return None;
+    }
+    let canonical_root = fs::canonicalize(docroot).await.ok()?;
+    let canonical = fs::canonicalize(candidate).await.ok()?;
+    if canonical.starts_with(&canonical_root) {
+        Some(canonical)
+    } else {
+        None
+    }
+}
 
 // MIME type mapping
 pub fn get_mime_type(extension: &str) -> &'static str {
@@ -75,24 +111,26 @@ pub fn is_static_file(path: &str) -> bool {
 pub async fn serve_static_file(docroot: &str, uri: &str) -> Response<Body> {
     // Sanitize path (prevent directory traversal)
     let clean_path = uri.trim_start_matches('/');
-    if clean_path.contains("..") {
+    if !is_safe_subpath(clean_path) {
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(Body::from("403 Forbidden"))
             .unwrap();
     }
-    
-    let file_path = format!("{}/{}", docroot, clean_path);
-    let path = Path::new(&file_path);
-    
-    // Check if file exists
-    if !path.exists() || !path.is_file() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("404 Not Found"))
-            .unwrap();
-    }
-    
+
+    // Resolve and confirm the file is contained within the document root.
+    let candidate = Path::new(docroot).join(clean_path);
+    let path = match resolve_within(docroot, &candidate).await {
+        Some(p) => p,
+        None => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("404 Not Found"))
+                .unwrap();
+        }
+    };
+    let path = path.as_path();
+
     // Read file
     let content = match fs::read(path).await {
         Ok(c) => c,
@@ -131,36 +169,62 @@ pub async fn serve_static_file(docroot: &str, uri: &str) -> Response<Body> {
 }
 
 
-// Check if PHP file exists
+// Check if PHP file exists. The resolved file is always confirmed to live
+// inside `docroot` (see `resolve_within`), preventing path-traversal / LFI.
 pub async fn find_php_file(docroot: &str, uri: &str) -> Option<String> {
-    let path = Path::new(docroot).join(uri.trim_start_matches('/'));
-    
-    // Case 1: Exact file exists (e.g., /index.php)
-    if path.exists() && path.is_file() {
-        return Some(path.to_string_lossy().to_string());
+    let subpath = uri.trim_start_matches('/');
+    if !is_safe_subpath(subpath) {
+        return None;
     }
-    
-    // Case 2: Try adding .php extension (e.g., /users → /users.php)
-    let php_path = path.with_extension("php");
-    if php_path.exists() && php_path.is_file() {
-        return Some(php_path.to_string_lossy().to_string());
-    }
-    
-    // Case 3: Try as directory with index.php (e.g., /admin → /admin/index.php)
-    let index_path = path.join("index.php");
-    if index_path.exists() && index_path.is_file() {
-        return Some(index_path.to_string_lossy().to_string());
-    }
-    
-    // Case 4: Try directory.php/index.php (e.g., /admin/dashboard → /admin/dashboard.php)
-    if let Some(parent) = path.parent() {
-        if let Some(file_name) = path.file_name() {
-            let dir_file_path = parent.join(file_name).with_extension("php");
-            if dir_file_path.exists() && dir_file_path.is_file() {
-                return Some(dir_file_path.to_string_lossy().to_string());
-            }
+
+    let base = Path::new(docroot).join(subpath);
+
+    // Candidates, in priority order:
+    //  1. Exact file              (/index.php)
+    //  2. With .php extension      (/users → /users.php, /admin/x → /admin/x.php)
+    //  3. Directory index         (/admin → /admin/index.php)
+    let candidates = [base.clone(), base.with_extension("php"), base.join("index.php")];
+
+    for candidate in candidates {
+        if let Some(resolved) = resolve_within(docroot, &candidate).await {
+            return Some(resolved.to_string_lossy().to_string());
         }
     }
-    
+
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_subpath;
+
+    #[test]
+    fn rejects_parent_dir_traversal() {
+        assert!(!is_safe_subpath("../etc/passwd"));
+        assert!(!is_safe_subpath("a/../../etc/passwd"));
+        assert!(!is_safe_subpath("../../../../etc/passwd"));
+        assert!(!is_safe_subpath(".."));
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        assert!(!is_safe_subpath("/etc/passwd"));
+    }
+
+    #[test]
+    fn allows_normal_paths() {
+        assert!(is_safe_subpath(""));
+        assert!(is_safe_subpath("index.php"));
+        assert!(is_safe_subpath("admin/index.php"));
+        assert!(is_safe_subpath("css/style.css"));
+        // Dots that are part of a name (not a whole component) are fine.
+        assert!(is_safe_subpath("my..weird..name.php"));
+    }
+
+    #[test]
+    fn encoded_traversal_is_not_a_parent_component() {
+        // Percent-encoded sequences are ordinary name chars here; they pass the
+        // lexical guard but cannot resolve outside docroot on disk.
+        assert!(is_safe_subpath("%2e%2e/%2e%2e/etc/passwd"));
+    }
 }

@@ -96,22 +96,22 @@ impl Worker {
         Ok(())
     }
 
-    pub fn should_restart(&self, config: &Config) -> Option<String> {
-        let memory_bytes = config.php.memory_limit_mb * 1024 * 1024;
+    pub fn should_restart(&self, memory_limit_mb: u64, max_requests: u64) -> Option<String> {
+        let memory_bytes = memory_limit_mb * 1024 * 1024;
 
         if self.last_memory > memory_bytes {
             return Some(format!(
                 "Worker #{}: Memory limit exceeded ({} MB > {} MB)",
                 self.index,
                 self.last_memory / 1024 / 1024,
-                config.php.memory_limit_mb
+                memory_limit_mb
             ));
         }
 
-        if self.requests_handled >= config.php.max_requests {
+        if self.requests_handled >= max_requests {
             return Some(format!(
                 "Worker #{}: Max requests reached ({} >= {})",
-                self.index, self.requests_handled, config.php.max_requests
+                self.index, self.requests_handled, max_requests
             ));
         }
 

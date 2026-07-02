@@ -2,7 +2,11 @@ server:
   host: "0.0.0.0"
   port: 8080
   https_port: 8443
-  admin_token: "dev-token-for-local-testing"
+  # Admin token for /health, /metrics, /reload and the queue API.
+  # Leave empty here and supply it via the BAKPIA_ADMIN_TOKEN environment
+  # variable. Admin routes fail CLOSED when no token is configured (set
+  # BAKPIA_ADMIN_INSECURE=1 to allow them without a token in local dev only).
+  admin_token: ""
   tls:
     enabled: true
     cert_path: "/home/bakpiarun-dev/bakpiarun/certs/cert.pem"

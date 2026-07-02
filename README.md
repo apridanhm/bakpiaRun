@@ -14,7 +14,7 @@ bakpiaRun is a modern PHP web server that combines Rust's performance with PHP's
 - **Process Isolation** - PHP crashes do not affect the main Rust server
 - **Anti-OOM System** - Auto-restart workers when memory limit is reached
 - **Static File Serving** - CSS/JS/images served directly by Rust (10x faster)
-- **Zero-Copy IPC** - Efficient communication via Unix Domain Sockets
+- **Lightweight IPC** - Length-prefixed JSON over Unix Domain Sockets
 
 ### Request Handling
 - `$_GET` parameters
@@ -208,18 +208,29 @@ curl http://localhost:8080/
 
 ## Performance Benchmark
 
-Tested with ApacheBench (`ab -n 10000 -c 100`) on a standard VPS.
+> **Read this before quoting numbers.** The figures below come from ApacheBench
+> (`ab -n 10000 -c 100`) on a standard VPS using a **trivial PHP script** (not a
+> full framework). Treat them as an indicative microbenchmark, not a guarantee:
+> re-run on your own hardware and workload, and compare like-for-like (same PHP
+> version, OpCache/JIT settings, and a realistic application).
 
-### bakpiaRun vs Competitors
+### bakpiaRun vs Competitors (trivial-script microbenchmark)
 
-| Runtime | Req/sec | Memory/worker | Total Memory | Median Latency |
-|---------|---------|---------------|--------------|----------------|
-| **bakpiaRun (32w)** | **1,871** 🏆 | **2 MB** 🏆 | **64 MB** 🏆 | **37ms**  |
-| FrankenPHP | 800-1,200 | 20-50 MB | 160-400 MB | 50-100ms |
-| RoadRunner | 1,000-2,000 | 30-60 MB | 240-960 MB | 40-80ms |
+| Runtime | Req/sec | Memory/worker¹ | Median Latency |
+|---------|---------|----------------|----------------|
+| bakpiaRun (32w) | ~1,871 | ~2 MB¹ | ~37 ms |
+| FrankenPHP | 800–1,200 | 20–50 MB | 50–100 ms |
+| RoadRunner | 1,000–2,000 | 30–60 MB | 40–80 ms |
 
-### Key Achievements
-- 🏆 **Beat FrankenPHP** in throughput (+55% faster) and memory efficiency (10x lower).
--  **100% Success Rate** handling 10,000 concurrent requests.
-- 🏆 **Ultra-low memory footprint**: Only 2MB per PHP worker.
-- 🏆 **All-in-one**: HTTP/2, Gzip, Rate Limiting, and Security Headers built-in.
+¹ The "~2 MB" figure is PHP's internal arena as reported by
+`memory_get_usage(true)` for a trivial script — **not the process RSS**. Real
+resident memory per PHP CLI worker (with PDO / a framework loaded) is typically
+~15–40 MB. Measure RSS (e.g. `ps`/`smem`) for capacity planning.
+
+### Notes & caveats
+- **IPC** is length-prefixed JSON over a Unix Domain Socket (not "zero-copy");
+  request/response bodies are serialized on both sides.
+- **Fair comparison:** FrankenPHP runs PHP in-process with OpCache/JIT and a
+  worker mode, so a meaningful head-to-head needs a realistic framework workload.
+  See `REVIEW.md` for current framework-compatibility status and roadmap.
+- **Built-in:** HTTP/2, Gzip, rate limiting, and security headers.

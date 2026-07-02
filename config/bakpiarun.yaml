@@ -4,13 +4,13 @@ server:
   https_port: 8443
   admin_token: "dev-token-for-local-testing"
   tls:
-    enabled: true
-    cert_path: "/home/bakpiarun-dev/bakpiarun/certs/cert.pem"
-    key_path: "/home/bakpiarun-dev/bakpiarun/certs/key.pem"
+    enabled: false
+    cert_path: "/app/certs/cert.pem"
+    key_path: "/app/certs/key.pem"
 
 php:
-  docroot: "/home/bakpiarun-dev/bakpiarun/public"
-  worker_path: "/home/bakpiarun-dev/bakpiarun/src-worker/worker.php"
+  docroot: "/app/public"
+  worker_path: "/app/src-worker/worker.php"
   worker_count: 32
   memory_limit_mb: 128
   max_requests: 5000
@@ -22,13 +22,13 @@ socket:
 
 logging:
   access_log_enabled: true
-  access_log: "/home/bakpiarun-dev/bakpiarun/logs/access.log"
+  access_log: "/app/logs/access.log"
   
   error_log_enabled: true
-  error_log: "/home/bakpiarun-dev/bakpiarun/logs/error.log"
+  error_log: "/app/logs/error.log"
   
   level: "info"  # debug, info, warn, error
-  file: "/home/bakpiarun-dev/bakpiarun/logs/bakpiarun.log"
+  file: "/app/logs/bakpiarun.log"
 
 rate_limit:
   enabled: false

@@ -4,6 +4,12 @@
 debug/
 release/
 
+# TLS certificates / private keys (NEVER commit key material)
+certs/*.pem
+certs/*.key
+certs/*.crt
+!certs/.gitkeep
+
 # Cargo lock (optional, tapi biasanya di-commit untuk binary projects)
 # Cargo.lock
 

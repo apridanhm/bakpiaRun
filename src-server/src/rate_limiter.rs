@@ -80,6 +80,36 @@ impl RateLimiter {
             })
         }
     }
+
+    /// Evict idle clients to bound memory. A client whose bucket has fully
+    /// refilled is indistinguishable from a brand-new one, so it is safe to
+    /// drop. Intended to be called periodically from a background task.
+    pub async fn cleanup(&self) {
+        if !self.enabled {
+            return;
+        }
+
+        let mut clients = self.clients.lock().await;
+        let now = Instant::now();
+        let refill_rate = self.requests_per_minute as f64 / 60.0;
+        let burst = self.burst_size as f64;
+        let before = clients.len();
+
+        clients.retain(|_, info| {
+            let elapsed = now.duration_since(info.last_update).as_secs_f64();
+            let tokens = (info.tokens + elapsed * refill_rate).min(burst);
+            tokens < burst // keep only clients still spending their budget
+        });
+
+        let removed = before - clients.len();
+        if removed > 0 {
+            println!(
+                "[RateLimiter] Cleaned up {} idle client(s), {} remaining",
+                removed,
+                clients.len()
+            );
+        }
+    }
 }
 
 #[derive(Debug)]

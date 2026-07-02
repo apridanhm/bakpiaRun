@@ -1,0 +1,12 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bakpiarun
+    volumes:
+      - ./config/bakpiarun.yaml:/app/config/bakpiarun.yaml
+      - ./certs:/app/certs
+    ports:
+      - "8002:8443"
+      - "8080:8080"

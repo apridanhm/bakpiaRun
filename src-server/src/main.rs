@@ -106,7 +106,7 @@ async fn main() {
 
     // Initialize Job Queue (only if enabled)
     let job_queue: Option<Arc<JobQueue>> = if config.queue.enabled {
-        let queue = Arc::new(JobQueue::new());
+        let queue = Arc::new(JobQueue::new(config.queue.max_jobs));
         println!("Queue System initialized (max jobs: {})", config.queue.max_jobs);
         Some(queue)
     } else {
@@ -265,6 +265,17 @@ async fn main() {
         });
     } else {
         println!("[Queue Worker] DISABLED (queue is off)");
+    }
+
+    // Periodic rate-limiter cleanup to bound memory (evicts idle clients).
+    {
+        let rate_limiter = state.rate_limiter.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                rate_limiter.cleanup().await;
+            }
+        });
     }
 
     // Graceful shutdown
