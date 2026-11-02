@@ -77,6 +77,9 @@ pools:
     memory_limit_mb: 512
     max_requests: 100
     timeout_ms: 300000
+    headers:
+      X-Workload: "heavy"
+      X-Pool: "heavy"
     patterns:
       - "/heavy-db.php"
       - "/heavy-*"
@@ -89,6 +92,9 @@ pools:
     memory_limit_mb: 128
     max_requests: 5000
     timeout_ms: 30000
+    headers:
+      X-Workload: "light"
+      X-Pool: "fast"
     patterns:
       - "/*"  # Default: semua request yang gak match heavy
 
