@@ -97,17 +97,22 @@ async fn main() {
         }
     };
 
-    if config.server.tls.enabled {
+    let https_std_listener = if config.server.tls.enabled {
         let https_addr = format!("{}:{}", config.server.host, config.server.https_port);
         match std::net::TcpListener::bind(&https_addr) {
-            Ok(temp_listener) => drop(temp_listener),
+            Ok(l) => {
+                let _ = l.set_nonblocking(true);
+                Some(l)
+            }
             Err(e) => {
                 eprintln!("\n❌ Failed to bind HTTPS server on {}: {}", https_addr, e);
                 eprintln!("💡 Hint: Port HTTPS {} sedang dipakai. Hentikan proses lama atau ubah 'server.https_port' di {}", config.server.https_port, cli.config);
                 std::process::exit(1);
             }
         }
-    }
+    } else {
+        None
+    };
 
     std::fs::create_dir_all(&config.socket.directory)
         .expect("Failed to create socket directory");
@@ -354,7 +359,8 @@ async fn main() {
                 *config = new_config.clone();
             }
             
-            let pm = state_for_reload.pool_manager.lock().await;
+            let mut pm = state_for_reload.pool_manager.lock().await;
+            pm.update_routing_table(&new_config);
             for (name, pool_arc) in &pm.pools {
                 println!("[Reload] Reloading pool '{}'...", name);
                 let pool_specific_config = if let Some(pc) = new_config.pools.iter().find(|p| &p.name == name) {
@@ -373,7 +379,7 @@ async fn main() {
     // HTTPS setup
     use axum_server::tls_rustls::RustlsConfig;
 
-    if config.server.tls.enabled {
+    if let Some(https_listener) = https_std_listener {
         println!("Setting up HTTPS server...");
         
         let https_addr: std::net::SocketAddr = format!("{}:{}", config.server.host, config.server.https_port)
@@ -392,7 +398,8 @@ async fn main() {
         let app_clone = app.clone();
         let pool_manager_for_https = state.pool_manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = axum_server::bind_rustls(https_addr, rustls_config)
+            if let Err(e) = axum_server::from_tcp_rustls(https_listener, rustls_config)
+                .unwrap()
                 .serve(app_clone.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             {

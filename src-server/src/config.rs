@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 //use std::path::PathBuf;
@@ -28,6 +29,8 @@ pub struct PoolConfig {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub patterns: Vec<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -1,12 +1,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use axum::http::HeaderMap;
 use crate::config::{Config, PoolConfig};
 use crate::worker_pool::WorkerPool;
 
+#[derive(Debug, Clone)]
+pub struct RoutingRule {
+    pub pool_name: String,
+    pub patterns: Vec<String>,
+    pub headers: HashMap<String, String>,
+}
+
 pub struct PoolManager {
     pub pools: HashMap<String, Arc<Mutex<WorkerPool>>>,
-    pub routing_table: Vec<(Vec<String>, String)>,
+    pub routing_table: Vec<RoutingRule>,
 }
 
 impl PoolManager {
@@ -61,15 +69,65 @@ impl PoolManager {
                 Arc::new(Mutex::new(pool))
             );
             
-            routing_table.push((
-                pool_config.patterns.clone(),
-                pool_config.name.clone()
-            ));
+            routing_table.push(RoutingRule {
+                pool_name: pool_config.name.clone(),
+                patterns: pool_config.patterns.clone(),
+                headers: pool_config.headers.clone(),
+            });
         }
 
         Self { pools, routing_table }
     }
 
+    pub fn update_routing_table(&mut self, config: &Config) {
+        let mut new_table = Vec::new();
+        for pool_config in &config.pools {
+            if self.pools.contains_key(&pool_config.name) {
+                new_table.push(RoutingRule {
+                    pool_name: pool_config.name.clone(),
+                    patterns: pool_config.patterns.clone(),
+                    headers: pool_config.headers.clone(),
+                });
+            }
+        }
+        self.routing_table = new_table;
+    }
+
+    fn match_header_value(actual: &str, expected_pattern: &str) -> bool {
+        let actual_lower = actual.trim().to_lowercase();
+        let expected_lower = expected_pattern.trim().to_lowercase();
+
+        if expected_lower == "*" || actual_lower == expected_lower {
+            return true;
+        }
+        if expected_lower.ends_with('*') {
+            let prefix = &expected_lower[..expected_lower.len() - 1];
+            return actual_lower.starts_with(prefix);
+        }
+        if expected_lower.starts_with('*') {
+            let suffix = &expected_lower[1..];
+            return actual_lower.ends_with(suffix);
+        }
+        false
+    }
+
+    fn match_headers(req_headers: &HeaderMap, rule_headers: &HashMap<String, String>) -> bool {
+        if rule_headers.is_empty() {
+            return false;
+        }
+        for (rule_key, rule_val) in rule_headers {
+            for (req_key, req_val) in req_headers.iter() {
+                if req_key.as_str().eq_ignore_ascii_case(rule_key) {
+                    if let Ok(val_str) = req_val.to_str() {
+                        if Self::match_header_value(val_str, rule_val) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
 
     fn match_pattern(path: &str, pattern: &str) -> bool {
         // Exact match
@@ -113,17 +171,33 @@ impl PoolManager {
         println!("[PoolManager] All pools stopped.");
     }
 
-    pub fn get_pool_name_for_path(&self, path: &str) -> Option<String> {
-        for (patterns, pool_name) in &self.routing_table {
-            for pattern in patterns {
+    /// Klasifikasi traffic HTTP ke Light/Fast Pool atau Heavy Pool berdasarkan
+    /// atribut HTTP Header (prioritas pertama) dan pola URL (prioritas kedua).
+    pub fn get_pool_name_for_request(&self, path: &str, req_headers: &HeaderMap) -> Option<String> {
+        // 1. Cek atribut HTTP Header terlebih dahulu (misal X-Workload: heavy)
+        for rule in &self.routing_table {
+            if Self::match_headers(req_headers, &rule.headers) {
+                return Some(rule.pool_name.clone());
+            }
+        }
+
+        // 2. Cek pencocokan pola URL (patterns)
+        for rule in &self.routing_table {
+            for pattern in &rule.patterns {
                 if Self::match_pattern(path, pattern) {
-                    return Some(pool_name.clone());
+                    return Some(rule.pool_name.clone());
                 }
             }
         }
         
         // Fallback ke pool pertama
-        self.routing_table.first().map(|(_, name)| name.clone())
+        self.routing_table.first().map(|rule| rule.pool_name.clone())
+    }
+
+    #[allow(dead_code)]
+    pub fn get_pool_name_for_path(&self, path: &str) -> Option<String> {
+        let empty_headers = HeaderMap::new();
+        self.get_pool_name_for_request(path, &empty_headers)
     }
 
     pub fn get_pool(&self, name: &str) -> Option<&Arc<Mutex<WorkerPool>>> {

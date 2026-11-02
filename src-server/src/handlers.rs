@@ -106,10 +106,10 @@ pub async fn php_handler(
         }
     };
 
-    // 🎯 ROUTING: Pilih pool berdasarkan URL pattern
+    // 🎯 WORKLOAD-AWARE ROUTER: Pilih pool berdasarkan atribut HTTP Header & URL pattern
     let pool_name = {
         let pm = state.pool_manager.lock().await;
-        match pm.get_pool_name_for_path(path) {
+        match pm.get_pool_name_for_request(path, &headers) {
             Some(name) => name,
             None => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -366,7 +366,8 @@ pub async fn php_handler(
 
             let mut response = axum::http::Response::builder()
                 .status(StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK))
-                .header("Content-Type", &config.php.default_content_type);
+                .header("Content-Type", &config.php.default_content_type)
+                .header("X-BakpiaRun-Pool", &pool_name);
 
             let config = state.config.lock().await;
             response = apply_security_headers(response, &config.security);
@@ -603,7 +604,8 @@ pub async fn reload_handler(State(state): State<AppState>) -> Response {
     }
     
     // reload semua pools menggunakan konfigurasi spesifik masing-masing pool
-    let pm = state.pool_manager.lock().await;
+    let mut pm = state.pool_manager.lock().await;
+    pm.update_routing_table(&new_config);
     let mut reload_results = Vec::new();
     
     for (name, pool_arc) in &pm.pools {
