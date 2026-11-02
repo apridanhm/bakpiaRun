@@ -35,10 +35,29 @@ impl Worker {
 
         let _ = std::fs::remove_file(&self.socket_path);
 
-        let child = Command::new("php")
-            .arg(&config.php.worker_path)
+        let timeout_sec = (config.php.timeout_ms as f64 / 1000.0).max(1.0);
+        let connect_host = if config.server.host == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            &config.server.host
+        };
+        let base_url = format!("http://{}:{}", connect_host, config.server.port);
+
+        let mut cmd = Command::new(&config.php.binary_path);
+        cmd.arg(&config.php.worker_path)
             .current_dir(&config.php.docroot)
             .env("BAKPIARUN_SOCKET_PATH", &self.socket_path)
+            .env("BAKPIARUN_TIMEOUT_SEC", timeout_sec.to_string())
+            .env("BAKPIARUN_MAX_PAYLOAD_MB", config.php.max_payload_mb.to_string())
+            .env("BAKPIARUN_SERVER_HOST", &config.server.host)
+            .env("BAKPIARUN_SERVER_PORT", config.server.port.to_string())
+            .env("BAKPIARUN_BASE_URL", &base_url);
+
+        if let Some(ref token) = config.server.admin_token {
+            cmd.env("BAKPIARUN_ADMIN_TOKEN", token);
+        }
+
+        let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn worker #{}: {}", self.index, e))?;
 
@@ -52,7 +71,16 @@ impl Worker {
             self.socket_path
         );
 
-        sleep(Duration::from_millis(500)).await;
+        // Wait until socket is ready or up to worker_startup_delay_ms
+        let max_wait_ms = config.php.worker_startup_delay_ms;
+        let mut waited_ms = 0;
+        while waited_ms < max_wait_ms {
+            if std::path::Path::new(&self.socket_path).exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+            waited_ms += 10;
+        }
         Ok(())
     }
 

@@ -29,7 +29,8 @@ use tokio::sync::Mutex;
 use axum::routing::{get, post};
 use axum::Router;
 use rate_limiter::RateLimiter;
-use tower_http::compression::CompressionLayer;
+use tower_http::compression::{CompressionLayer, predicate::SizeAbove};
+use tower_http::CompressionLevel;
 use pool_manager::PoolManager;
 use std::time::Duration;
 use middleware::admin_auth::admin_auth_middleware;
@@ -81,6 +82,32 @@ async fn main() {
     println!("   - Max Requests: {}", config.php.max_requests);
     println!("   - Socket Dir: {}", config.socket.directory);
     println!("   - Queue Enabled: {}", config.queue.enabled);
+
+    // Bind HTTP port FIRST before spawning PHP workers so we don't leave orphan workers or overwrite sockets if port is already in use
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("\n❌ Failed to bind HTTP server on {}: {}", addr, e);
+            eprintln!("💡 Hint: Port {} sedang dipakai (kemungkinan instance bakpiarun lama masih berjalan).", config.server.port);
+            eprintln!("   Hentikan dulu proses lama dengan:");
+            eprintln!("     pkill -f bakpiarun; pkill -f worker.php");
+            eprintln!("   Atau ubah 'server.port' di {}", cli.config);
+            std::process::exit(1);
+        }
+    };
+
+    if config.server.tls.enabled {
+        let https_addr = format!("{}:{}", config.server.host, config.server.https_port);
+        match std::net::TcpListener::bind(&https_addr) {
+            Ok(temp_listener) => drop(temp_listener),
+            Err(e) => {
+                eprintln!("\n❌ Failed to bind HTTPS server on {}: {}", https_addr, e);
+                eprintln!("💡 Hint: Port HTTPS {} sedang dipakai. Hentikan proses lama atau ubah 'server.https_port' di {}", config.server.https_port, cli.config);
+                std::process::exit(1);
+            }
+        }
+    }
 
     std::fs::create_dir_all(&config.socket.directory)
         .expect("Failed to create socket directory");
@@ -185,11 +212,15 @@ async fn main() {
 
     let app = app.with_state(state.clone());
 
-    let app = app.with_state(state.clone());
-
     // compression middleware
     let app = if config.compression.enabled {
-        app.layer(CompressionLayer::new())
+        let level = CompressionLevel::Precise(config.compression.level.clamp(1, 9) as i32);
+        let min_size = config.compression.min_size_bytes.min(u16::MAX as usize) as u16;
+        app.layer(
+            CompressionLayer::new()
+                .quality(level)
+                .compress_when(SizeAbove::new(min_size))
+        )
     } else {
         app
     };
@@ -251,11 +282,12 @@ async fn main() {
     }
 
     // Start Background Queue Worker (only if enabled)
+    let queue_poll_interval_ms = config.queue.poll_interval_ms;
     if let (Some(queue_worker), Some(handlers)) = (job_queue.clone(), handler_registry.clone()) {
         tokio::spawn(async move {
             println!("[Queue Worker] Background worker started with Handlers!");
             loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(queue_poll_interval_ms)).await;
                 
                 if let Some(job_id) = queue_worker.dequeue().await {
                     println!("[Queue Worker] Processing job: {}", job_id);
@@ -325,8 +357,13 @@ async fn main() {
             let pm = state_for_reload.pool_manager.lock().await;
             for (name, pool_arc) in &pm.pools {
                 println!("[Reload] Reloading pool '{}'...", name);
+                let pool_specific_config = if let Some(pc) = new_config.pools.iter().find(|p| &p.name == name) {
+                    PoolManager::build_pool_config(&new_config, pc)
+                } else {
+                    new_config.clone()
+                };
                 let mut pool = pool_arc.lock().await;
-                if let Err(e) = pool.reload(&new_config).await {
+                if let Err(e) = pool.reload(&pool_specific_config).await {
                     eprintln!("[Reload] Failed to reload pool '{}': {}", name, e);
                 }
             }
@@ -353,18 +390,28 @@ async fn main() {
         println!("HTTPS (HTTP/2) listening on https://{}", https_addr);
         
         let app_clone = app.clone();
+        let pool_manager_for_https = state.pool_manager.clone();
         tokio::spawn(async move {
-            axum_server::bind_rustls(https_addr, rustls_config)
+            if let Err(e) = axum_server::bind_rustls(https_addr, rustls_config)
                 .serve(app_clone.into_make_service_with_connect_info::<SocketAddr>())
                 .await
-                .expect("HTTPS server failed");
+            {
+                eprintln!("❌ HTTPS server failed on {}: {}", https_addr, e);
+                let pm = pool_manager_for_https.lock().await;
+                pm.stop_all().await;
+                std::process::exit(1);
+            }
         });
     }
 
-    // Start HTTP server
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(
+    // Start HTTP server using pre-bound listener
+    if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>()
-    ).await.unwrap();
+    ).await {
+        eprintln!("❌ HTTP server failed: {}", e);
+        let pm = state.pool_manager.lock().await;
+        pm.stop_all().await;
+        std::process::exit(1);
+    }
 }

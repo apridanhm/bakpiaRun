@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct WorkerPool {
     pub workers: Vec<Worker>,
+    pub config: Config,
     current_index: AtomicUsize,
 }
 
@@ -18,11 +19,13 @@ impl WorkerPool {
 
         Self {
             workers,
+            config: config.clone(),
             current_index: AtomicUsize::new(0),
         }
     }
 
     pub async fn start_all(&mut self, config: &Config) -> Result<(), String> {
+        self.config = config.clone();
         for worker in &mut self.workers {
             worker.start(config).await?;
         }
@@ -44,6 +47,7 @@ impl WorkerPool {
         // rolling restart untuk graceful reload
         pub async fn reload(&mut self, config: &Config) -> Result<(), String> {
             println!("[Reload] Starting rolling restart of workers...");
+            self.config = config.clone();
             
             // stop semua worker lama
             println!("[Reload] Stopping old workers...");
@@ -64,10 +68,11 @@ impl WorkerPool {
             
             // start worker baru satu-satu (rolling)
             println!("[Reload] Starting new workers...");
+            let delay_ms = config.php.rolling_restart_delay_ms;
             for worker in &mut self.workers {
                 worker.start(config).await?;
                 // Delay kecil biar gak overload
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
             }
             
             println!("[Reload] Rolling restart complete! {} workers active", self.workers.len());
