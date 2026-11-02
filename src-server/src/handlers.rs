@@ -16,6 +16,7 @@ use crate::ipc::send_to_php_worker;
 use crate::static_file;
 use crate::config::Config;
 use crate::security::apply_security_headers;
+use crate::anti_oom::read_cgroup_v2_memory;
 
 
 #[derive(Deserialize)]
@@ -124,29 +125,27 @@ pub async fn php_handler(
     };
     println!("[Router] {} → Pool: {}", path, pool_name);
 
-    // Ambil worker dari pool yang dipilih beserta pool_config
-    let (worker_index, pool_config) = {
+    // Ambil worker dari pool yang dipilih beserta pool_config (isolasi lock per-worker)
+    let (worker_index, worker_arc, pool_config) = {
         let pm = state.pool_manager.lock().await;
-        let pool_arc = pm.get_pool(&pool_name).unwrap();
+        let pool_arc = pm.get_pool(&pool_name).unwrap().clone();
+        drop(pm);
         let pool = pool_arc.lock().await;
-        (pool.get_next_worker(), pool.config.clone())
+        let (idx, w_arc) = pool.get_next_worker();
+        (idx, w_arc, pool.config.clone())
     };
 
-    // Ensure worker running
+    // Ensure worker running (hanya lock worker spesifik ini, tidak mengunci seluruh pool!)
     {
-        let pm = state.pool_manager.lock().await;
-        let pool_arc = pm.get_pool(&pool_name).unwrap();
-        let mut pool = pool_arc.lock().await;
-        if let Some(worker) = pool.workers.get_mut(worker_index) {
-            if let Err(e) = worker.ensure_running(&pool_config).await {
-                let duration_ms = start_time.elapsed().as_millis() as u64;
-                state.logger.log_error("ERROR", &format!("Worker #{} in pool '{}' failed to start: {} (URI: {})", worker_index, pool_name, e, uri));
-                state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Html(format!("<h1>500 Error</h1><p>Failed to start worker: {}</p>", e)),
-                ).into_response();
-            }
+        let mut worker = worker_arc.lock().await;
+        if let Err(e) = worker.ensure_running(&pool_config).await {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            state.logger.log_error("ERROR", &format!("Worker #{} in pool '{}' failed to start: {} (URI: {})", worker_index, pool_name, e, uri));
+            state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(format!("<h1>500 Error</h1><p>Failed to start worker: {}</p>", e)),
+            ).into_response();
         }
     }
 
@@ -188,6 +187,7 @@ pub async fn php_handler(
     let body_string = String::from_utf8_lossy(&body_bytes).to_string();
 
     let mut post_params: HashMap<String, String> = HashMap::new();
+    let mut uploaded_temp_files: Vec<String> = Vec::new();
     let mut files: HashMap<String, Vec<FileInfo>> = HashMap::new();
     
     let content_type = headers
@@ -247,6 +247,7 @@ pub async fn php_handler(
                                 
                                 if write_ok {
                                     println!("[Upload] File saved: {} ({} bytes)", fname, total_size);
+                                    uploaded_temp_files.push(temp_path.clone());
                                     files.entry(name.clone()).or_default().push(FileInfo {
                                         name: fname,
                                         content_type: field_content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
@@ -300,12 +301,10 @@ pub async fn php_handler(
         files,
     };
 
-    // AMBIL socket_path, conn_pool, pool_size DARI POOL YANG DIPILIH
+    // AMBIL socket_path, conn_pool, pool_size DARI WORKER YANG DIPILIH & tandai active_requests += 1
     let (socket_path, conn_pool, pool_size) = {
-        let pm = state.pool_manager.lock().await;
-        let pool_arc = pm.get_pool(&pool_name).unwrap();
-        let pool = pool_arc.lock().await;
-        let w = &pool.workers[worker_index];
+        let mut w = worker_arc.lock().await;
+        w.active_requests += 1;
         (w.socket_path.clone(), w.connection_pool.clone(), w.pool_size)
     };
 
@@ -315,6 +314,11 @@ pub async fn php_handler(
         timeout_duration, 
         send_to_php_worker(&socket_path, &conn_pool, pool_size, request)
     ).await;
+
+    // Cleanup temporary uploaded files after PHP worker finishes processing
+    for tmp_file in &uploaded_temp_files {
+        let _ = std::fs::remove_file(tmp_file);
+    }
 
     match result {
         Ok(Ok(php_response)) => {
@@ -332,42 +336,49 @@ pub async fn php_handler(
                 metrics.record_request(worker_index, php_response.memory);
             }
 
-            // UPDATE stats worker di pool yang dipilih
+            // UPDATE stats worker (/proc/[pid]/status VmRSS + PHP memory) tanpa mengunci seluruh pool
             let restart_reason = {
-                let pm = state.pool_manager.lock().await;
-                let pool_arc = pm.get_pool(&pool_name).unwrap();
-                let mut pool = pool_arc.lock().await;
-                if let Some(worker) = pool.workers.get_mut(worker_index) {
-                    worker.update_stats(php_response.memory, php_response.peak);
-                    println!(
-                        "[Pool:{}] Worker #{} Request #{} handled. Memory: {} MB, Peak: {} MB",
-                        pool_name,
-                        worker_index,
-                        worker.requests_handled,
-                        php_response.memory / 1024 / 1024,
-                        php_response.peak / 1024 / 1024
-                    );
-                    worker.should_restart(&pool_config)
-                } else {
-                    None
-                }
+                let mut worker = worker_arc.lock().await;
+                worker.active_requests = worker.active_requests.saturating_sub(1);
+                worker.update_stats(php_response.memory, php_response.peak);
+                println!(
+                    "[Pool:{}] Worker #{} (PID: {:?}) Request #{} handled. PHP Mem: {} MB, Peak: {} MB, /proc VmRSS: {} MB",
+                    pool_name,
+                    worker_index,
+                    worker.pid,
+                    worker.requests_handled,
+                    php_response.memory / 1024 / 1024,
+                    php_response.peak / 1024 / 1024,
+                    worker.rss_bytes / 1024 / 1024
+                );
+                worker.should_restart(&pool_config)
             };
 
             if let Some(reason) = restart_reason {
                 println!("[Anti-OOM] {}", reason);
-                println!("[Anti-OOM] Restarting worker #{} in pool '{}'...", worker_index, pool_name);
-                let pm = state.pool_manager.lock().await;
-                let pool_arc = pm.get_pool(&pool_name).unwrap();
-                let mut pool = pool_arc.lock().await;
-                if let Some(worker) = pool.workers.get_mut(worker_index) {
-                    worker.stop().await;
+                let mut worker = worker_arc.lock().await;
+                if let Err(e) = worker.graceful_recycle(&pool_config).await {
+                    eprintln!("[Anti-OOM] Failed to recycle worker #{} in pool '{}': {}", worker_index, pool_name, e);
                 }
             }
 
+            let content_type_hdr = php_response
+                .headers
+                .get("content-type")
+                .or_else(|| php_response.headers.get("Content-Type"))
+                .cloned()
+                .unwrap_or_else(|| config.php.default_content_type.clone());
+
             let mut response = axum::http::Response::builder()
                 .status(StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK))
-                .header("Content-Type", &config.php.default_content_type)
+                .header("Content-Type", &content_type_hdr)
                 .header("X-BakpiaRun-Pool", &pool_name);
+
+            for (hdr_k, hdr_v) in &php_response.headers {
+                if !hdr_k.eq_ignore_ascii_case("content-type") {
+                    response = response.header(hdr_k.as_str(), hdr_v.as_str());
+                }
+            }
 
             let config = state.config.lock().await;
             response = apply_security_headers(response, &config.security);
@@ -399,12 +410,9 @@ pub async fn php_handler(
             }
             eprintln!("[Pool:{}] Worker #{} Error: {}", pool_name, worker_index, e);
             {
-                let pm = state.pool_manager.lock().await;
-                let pool_arc = pm.get_pool(&pool_name).unwrap();
-                let mut pool = pool_arc.lock().await;
-                if let Some(worker) = pool.workers.get_mut(worker_index) {
-                    let _ = worker.ensure_running(&pool_config).await;
-                }
+                let mut worker = worker_arc.lock().await;
+                worker.active_requests = worker.active_requests.saturating_sub(1);
+                let _ = worker.ensure_running(&pool_config).await;
             }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -425,13 +433,10 @@ pub async fn php_handler(
             }
             
             {
-                let pm = state.pool_manager.lock().await;
-                let pool_arc = pm.get_pool(&pool_name).unwrap();
-                let mut pool = pool_arc.lock().await;
-                if let Some(worker) = pool.workers.get_mut(worker_index) {
-                    println!("[Timeout] Restarting worker #{} in pool '{}'...", worker_index, pool_name);
-                    worker.stop().await;
-                }
+                let mut worker = worker_arc.lock().await;
+                worker.active_requests = worker.active_requests.saturating_sub(1);
+                println!("[Timeout] Gracefully recycling timed-out worker #{} in pool '{}'...", worker_index, pool_name);
+                let _ = worker.graceful_recycle(&pool_config).await;
             }
             
             (
@@ -446,11 +451,18 @@ pub async fn php_handler(
 }
 
 pub async fn health_handler(State(state): State<AppState>) -> Response {
+    let config = state.config.lock().await.clone();
     let pm = state.pool_manager.lock().await;
     let metrics = state.metrics.lock().await;
     
+    let cgroup_mem = read_cgroup_v2_memory(
+        &config.anti_oom.cgroup_memory_current_path,
+        &config.anti_oom.cgroup_memory_max_path,
+    );
+
     let mut total_workers = 0;
     let mut workers_healthy = 0;
+    let mut total_recycles = 0u64;
     let mut all_pools_info = Vec::new();
     
     for (pool_name, pool_arc) in &pm.pools {
@@ -458,19 +470,29 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         let mut pool_healthy = 0;
         let mut pool_workers_info = Vec::new();
         
-        for worker in &pool.workers {
+        for worker_arc in &pool.workers {
+            let mut worker = worker_arc.lock().await;
+            worker.refresh_proc_memory();
             let is_alive = worker.process.is_some();
             if is_alive {
                 workers_healthy += 1;
                 pool_healthy += 1;
             }
             total_workers += 1;
+            total_recycles += worker.recycle_count;
             
             pool_workers_info.push(serde_json::json!({
                 "index": worker.index,
+                "pid": worker.pid,
                 "alive": is_alive,
+                "draining": worker.draining,
+                "active_requests": worker.active_requests,
                 "requests": worker.requests_handled,
+                "recycle_count": worker.recycle_count,
                 "memory_mb": worker.last_memory / 1024 / 1024,
+                "peak_memory_mb": worker.last_peak / 1024 / 1024,
+                "proc_rss_mb": worker.rss_bytes / 1024 / 1024,
+                "proc_hwm_mb": worker.hwm_bytes / 1024 / 1024,
             }));
         }
         
@@ -478,6 +500,8 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
             "name": pool_name,
             "total": pool.workers.len(),
             "healthy": pool_healthy,
+            "memory_limit_mb": pool.config.php.memory_limit_mb,
+            "worker_threshold_percent": pool.config.anti_oom.worker_threshold_percent,
             "workers": pool_workers_info,
         }));
     }
@@ -489,6 +513,20 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         "uptime_seconds": metrics.uptime_seconds(),
         "total_requests": metrics.total_requests,
         "total_errors": metrics.total_errors,
+        "anti_oom": {
+            "enabled": config.anti_oom.enabled,
+            "worker_threshold_percent": config.anti_oom.worker_threshold_percent,
+            "cgroup_threshold_percent": config.anti_oom.cgroup_threshold_percent,
+            "total_worker_recycles": total_recycles,
+            "cgroup_memory": {
+                "source": cgroup_mem.source,
+                "current_bytes": cgroup_mem.current_bytes,
+                "current_mb": cgroup_mem.current_bytes / 1024 / 1024,
+                "max_bytes": cgroup_mem.max_bytes,
+                "max_mb": cgroup_mem.max_bytes / 1024 / 1024,
+                "usage_percent": (cgroup_mem.usage_percent * 100.0).round() / 100.0,
+            }
+        },
         "pools": all_pools_info,
         "workers": {
             "total": total_workers,
@@ -506,9 +544,15 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
 }
 
 pub async fn metrics_handler(State(state): State<AppState>) -> Response {
+    let config = state.config.lock().await.clone();
     let pm = state.pool_manager.lock().await;
     let metrics = state.metrics.lock().await;
     
+    let cgroup_mem = read_cgroup_v2_memory(
+        &config.anti_oom.cgroup_memory_current_path,
+        &config.anti_oom.cgroup_memory_max_path,
+    );
+
     let mut output = String::new();
     
     output.push_str("# HELP bakpiarun_uptime_seconds Server uptime in seconds\n");
@@ -522,18 +566,73 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response {
     output.push_str("# HELP bakpiarun_errors_total Total number of errors\n");
     output.push_str("# TYPE bakpiarun_errors_total counter\n");
     output.push_str(&format!("bakpiarun_errors_total {}\n\n", metrics.total_errors));
+
+    output.push_str("# HELP bakpiarun_cgroup_memory_current_bytes Aggregate container memory usage from cgroups v2\n");
+    output.push_str("# TYPE bakpiarun_cgroup_memory_current_bytes gauge\n");
+    output.push_str(&format!("bakpiarun_cgroup_memory_current_bytes{{source=\"{}\"}} {}\n\n", cgroup_mem.source, cgroup_mem.current_bytes));
+
+    output.push_str("# HELP bakpiarun_cgroup_memory_max_bytes Maximum container memory limit from cgroups v2\n");
+    output.push_str("# TYPE bakpiarun_cgroup_memory_max_bytes gauge\n");
+    output.push_str(&format!("bakpiarun_cgroup_memory_max_bytes{{source=\"{}\"}} {}\n\n", cgroup_mem.source, cgroup_mem.max_bytes));
+
+    output.push_str("# HELP bakpiarun_cgroup_memory_usage_percent Container cgroups v2 memory usage percentage\n");
+    output.push_str("# TYPE bakpiarun_cgroup_memory_usage_percent gauge\n");
+    output.push_str(&format!("bakpiarun_cgroup_memory_usage_percent{{source=\"{}\"}} {:.2}\n\n", cgroup_mem.source, cgroup_mem.usage_percent));
     
     output.push_str("# HELP bakpiarun_worker_requests_total Requests per worker\n");
     output.push_str("# TYPE bakpiarun_worker_requests_total counter\n");
-    for (i, &count) in metrics.requests_per_worker.iter().enumerate() {
-        output.push_str(&format!("bakpiarun_worker_requests_total{{worker=\"{}\"}} {}\n", i, count));
+    for (pool_name, pool_arc) in &pm.pools {
+        let pool = pool_arc.lock().await;
+        for worker_arc in &pool.workers {
+            let worker = worker_arc.lock().await;
+            output.push_str(&format!(
+                "bakpiarun_worker_requests_total{{pool=\"{}\",worker=\"{}\"}} {}\n",
+                pool_name, worker.index, worker.requests_handled
+            ));
+        }
     }
     output.push('\n');
     
-    output.push_str("# HELP bakpiarun_worker_memory_bytes Memory usage per worker\n");
+    output.push_str("# HELP bakpiarun_worker_memory_bytes PHP memory usage per worker in bytes\n");
     output.push_str("# TYPE bakpiarun_worker_memory_bytes gauge\n");
-    for (i, &mem) in metrics.memory_per_worker.iter().enumerate() {
-        output.push_str(&format!("bakpiarun_worker_memory_bytes{{worker=\"{}\"}} {}\n", i, mem));
+    for (pool_name, pool_arc) in &pm.pools {
+        let pool = pool_arc.lock().await;
+        for worker_arc in &pool.workers {
+            let worker = worker_arc.lock().await;
+            output.push_str(&format!(
+                "bakpiarun_worker_memory_bytes{{pool=\"{}\",worker=\"{}\"}} {}\n",
+                pool_name, worker.index, worker.last_memory
+            ));
+        }
+    }
+    output.push('\n');
+
+    output.push_str("# HELP bakpiarun_worker_proc_rss_bytes OS VmRSS from /proc/[pid]/status per worker in bytes\n");
+    output.push_str("# TYPE bakpiarun_worker_proc_rss_bytes gauge\n");
+    for (pool_name, pool_arc) in &pm.pools {
+        let pool = pool_arc.lock().await;
+        for worker_arc in &pool.workers {
+            let mut worker = worker_arc.lock().await;
+            worker.refresh_proc_memory();
+            output.push_str(&format!(
+                "bakpiarun_worker_proc_rss_bytes{{pool=\"{}\",worker=\"{}\"}} {}\n",
+                pool_name, worker.index, worker.rss_bytes
+            ));
+        }
+    }
+    output.push('\n');
+
+    output.push_str("# HELP bakpiarun_worker_recycles_total Total proactive graceful worker recycles by Anti-OOM Engine\n");
+    output.push_str("# TYPE bakpiarun_worker_recycles_total counter\n");
+    for (pool_name, pool_arc) in &pm.pools {
+        let pool = pool_arc.lock().await;
+        for worker_arc in &pool.workers {
+            let worker = worker_arc.lock().await;
+            output.push_str(&format!(
+                "bakpiarun_worker_recycles_total{{pool=\"{}\",worker=\"{}\"}} {}\n",
+                pool_name, worker.index, worker.recycle_count
+            ));
+        }
     }
     output.push('\n');
     
@@ -541,7 +640,8 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response {
     output.push_str("# TYPE bakpiarun_worker_alive gauge\n");
     for (pool_name, pool_arc) in &pm.pools {
         let pool = pool_arc.lock().await;
-        for worker in &pool.workers {
+        for worker_arc in &pool.workers {
+            let worker = worker_arc.lock().await;
             let alive = if worker.process.is_some() { 1 } else { 0 };
             output.push_str(&format!(
                 "bakpiarun_worker_alive{{pool=\"{}\",worker=\"{}\"}} {}\n",

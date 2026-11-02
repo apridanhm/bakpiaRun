@@ -136,9 +136,13 @@ pub async fn serve_static_file(docroot: &str, uri: &str, cache_max_age: u64) -> 
 }
 
 
-// Check if PHP file exists
+// Check if PHP file exists (with directory traversal sanitization)
 pub async fn find_php_file(docroot: &str, uri: &str) -> Option<String> {
-    let path = Path::new(docroot).join(uri.trim_start_matches('/'));
+    let clean_uri = uri.trim_start_matches('/');
+    if clean_uri.contains("..") {
+        return None;
+    }
+    let path = Path::new(docroot).join(clean_uri);
     
     // Case 1: Exact file exists (e.g., /index.php)
     if path.exists() && path.is_file() {

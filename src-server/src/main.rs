@@ -14,7 +14,9 @@ mod queue;
 mod job_handlers;
 mod middleware;
 mod db_proxy;
+mod anti_oom;
 
+use anti_oom::AntiOomEngine;
 use queue::JobQueue;
 use job_handlers::HandlerRegistry;
 use clap::Parser;
@@ -175,6 +177,9 @@ async fn main() {
         rate_limiter: Arc::new(rate_limiter),
         queue: job_queue.clone(),
     };
+
+    // Start Proactive Anti-OOM Engine (/proc/[pid]/status + cgroups v2 + graceful worker recycling)
+    AntiOomEngine::start_monitor(state.config.clone(), state.pool_manager.clone());
 
     // Build Router
     //let mut app = Router::new()

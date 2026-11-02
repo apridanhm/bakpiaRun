@@ -4,14 +4,30 @@
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
 
+function bakpia_log(string $msg): void {
+    fwrite(STDERR, $msg . "\n");
+}
+
+// Helper bagi aplikasi PHP di mode CLI jika ingin menambahkan custom response header
+$GLOBALS['__BAKPIARUN_HEADERS'] = [];
+function bakpiarun_header(string $header_line, bool $replace = true, int $response_code = 0): void {
+    if ($response_code > 0) {
+        http_response_code($response_code);
+    }
+    $parts = explode(':', $header_line, 2);
+    if (count($parts) === 2) {
+        $GLOBALS['__BAKPIARUN_HEADERS'][trim($parts[0])] = trim($parts[1]);
+    }
+}
+
 $running = true;
 pcntl_async_signals(true);
 pcntl_signal(SIGTERM, function() use (&$running) { 
-    echo "[PHP Worker] Received SIGTERM, shutting down...\n";
+    bakpia_log("[PHP Worker] Received SIGTERM, shutting down...");
     $running = false; 
 });
 pcntl_signal(SIGINT, function() use (&$running) { 
-    echo "[PHP Worker] Received SIGINT, shutting down...\n";
+    bakpia_log("[PHP Worker] Received SIGINT, shutting down...");
     $running = false; 
 });
 pcntl_signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE
@@ -38,9 +54,9 @@ if (!$server) {
     die("Gagal membuat socket: {$errstr} ({$errno})\n");
 }
 
-echo "[PHP Worker] Listening on unix://{$socketPath}\n";
-echo "[PHP Worker] Ready to accept requests...\n";
-echo "[PHP Worker] PID: " . getmypid() . "\n";
+bakpia_log("[PHP Worker] Listening on unix://{$socketPath}");
+bakpia_log("[PHP Worker] Ready to accept requests...");
+bakpia_log("[PHP Worker] PID: " . getmypid());
 
 while ($running) {
     try {
@@ -55,7 +71,7 @@ while ($running) {
         // Baca length header (4 bytes)
         $lengthHeader = @fread($client, 4);
         if ($lengthHeader === false || strlen($lengthHeader) < 4) {
-            echo "[PHP Worker] Failed to read length header\n";
+            bakpia_log("[PHP Worker] Failed to read length header");
             fclose($client);
             continue;
         }
@@ -64,7 +80,7 @@ while ($running) {
         
         // Sanity check: jangan terima payload melebihi batas config
         if ($payloadLength > $maxPayloadBytes) {
-            echo "[PHP Worker] Payload too large: {$payloadLength} bytes (max: {$maxPayloadBytes})\n";
+            bakpia_log("[PHP Worker] Payload too large: {$payloadLength} bytes (max: {$maxPayloadBytes})");
             fclose($client);
             continue;
         }
@@ -77,13 +93,13 @@ while ($running) {
             $chunk = @fread($client, min(8192, $payloadLength - $bytesRead));
             
             if ($chunk === false) {
-                echo "[PHP Worker] fread() returned false\n";
+                bakpia_log("[PHP Worker] fread() returned false");
                 $readFailed = true;
                 break;
             }
             
             if (strlen($chunk) === 0) {
-                echo "[PHP Worker] Connection closed (EOF)\n";
+                bakpia_log("[PHP Worker] Connection closed (EOF)");
                 $readFailed = true;
                 break;
             }
@@ -93,19 +109,19 @@ while ($running) {
         }
         
         if ($readFailed || $bytesRead !== $payloadLength) {
-            echo "[PHP Worker] Failed to read full payload (got {$bytesRead} of {$payloadLength} bytes)\n";
+            bakpia_log("[PHP Worker] Failed to read full payload (got {$bytesRead} of {$payloadLength} bytes)");
             fclose($client);
             continue;
         }
         
         $request = json_decode($payload, true);
         if (!$request) {
-            echo "[PHP Worker] Invalid JSON: " . json_last_error_msg() . "\n";
+            bakpia_log("[PHP Worker] Invalid JSON: " . json_last_error_msg());
             fclose($client);
             continue;
         }
 
-        echo "[PHP Worker] Handling request: " . ($request['method'] ?? '?') . " " . ($request['uri'] ?? '?') . "\n";
+        bakpia_log("[PHP Worker] Handling request: " . ($request['method'] ?? '?') . " " . ($request['uri'] ?? '?'));
 
         // --- INJECT SUPERGLOBALS ---
         $docroot = getcwd();
@@ -155,12 +171,10 @@ while ($running) {
         $_FILES = [];
         if (isset($request['files']) && is_array($request['files'])) {
             foreach ($request['files'] as $field_name => $file_list) {
-                // Cek apakah field ini array (misal name="files[]") atau single
                 $is_array_field = str_ends_with($field_name, '[]');
                 $clean_name = rtrim($field_name, '[]');
                 
                 if ($is_array_field) {
-                    // Format array untuk multiple files
                     $_FILES[$clean_name] = [
                         'name' => [],
                         'type' => [],
@@ -180,7 +194,6 @@ while ($running) {
                         }
                     }
                 } else {
-                    // Format single file
                     if (isset($file_list[0])) {
                         $file_info = $file_list[0];
                         $tmp_path = $file_info['tmp_path'] ?? '';
@@ -209,6 +222,11 @@ while ($running) {
         }
 
         // --- EKSEKUSI PHP ---
+        $GLOBALS['__BAKPIARUN_HEADERS'] = [];
+        http_response_code(200);
+        if (function_exists('header_remove')) {
+            @header_remove();
+        }
         ob_start();
         
         $filePath = $request['file_path'] ?? '';
@@ -218,6 +236,10 @@ while ($running) {
         try {
             if ($filePath && file_exists($filePath)) {
                 include $filePath;
+                $code = http_response_code();
+                if (is_int($code) && $code >= 100 && $code <= 599) {
+                    $status = $code;
+                }
             } else {
                 $status = 404;
                 echo "<h1>404 Not Found</h1><p>File tidak ditemukan: " . htmlspecialchars($filePath) . "</p>";
@@ -229,6 +251,15 @@ while ($running) {
         }
 
         $body = ob_get_clean();
+        $respHeaders = $GLOBALS['__BAKPIARUN_HEADERS'];
+        if (function_exists('headers_list')) {
+            foreach (headers_list() as $rawHeader) {
+                $parts = explode(':', $rawHeader, 2);
+                if (count($parts) === 2) {
+                    $respHeaders[trim($parts[0])] = trim($parts[1]);
+                }
+            }
+        }
 
         $currentMemory = memory_get_usage(true);
         $peakMemory = memory_get_peak_usage(true);
@@ -236,6 +267,7 @@ while ($running) {
         // --- KIRIM RESPONSE ---
         $response = [
             'status'  => $status,
+            'headers' => (object)$respHeaders,
             'body'    => $body,
             'memory'  => $currentMemory,
             'peak'    => $peakMemory,
@@ -243,7 +275,7 @@ while ($running) {
 
         $responseJson = json_encode($response, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if ($responseJson === false) {
-            echo "[PHP Worker] Failed to encode response: " . json_last_error_msg() . "\n";
+            bakpia_log("[PHP Worker] Failed to encode response: " . json_last_error_msg());
             fclose($client);
             continue;
         }
@@ -252,20 +284,19 @@ while ($running) {
         
         $written = @fwrite($client, $responsePayload);
         if ($written === false) {
-            echo "[PHP Worker] Failed to write response\n";
+            bakpia_log("[PHP Worker] Failed to write response");
         } else {
-            echo "[PHP Worker] Response sent: " . strlen($responsePayload) . " bytes\n";
+            bakpia_log("[PHP Worker] Response sent: " . strlen($responsePayload) . " bytes");
         }
 
         fflush($client);
         fclose($client);
         
-        echo "[PHP Worker] Request complete\n";
+        bakpia_log("[PHP Worker] Request complete");
         
     } catch (Throwable $e) {
-        echo "[PHP Worker] FATAL ERROR: " . $e->getMessage() . "\n";
-        echo "[PHP Worker] Stack trace: " . $e->getTraceAsString() . "\n";
-        // Jangan exit, lanjut ke request berikutnya
+        bakpia_log("[PHP Worker] FATAL ERROR: " . $e->getMessage());
+        bakpia_log("[PHP Worker] Stack trace: " . $e->getTraceAsString());
         if (isset($client) && is_resource($client)) {
             @fclose($client);
         }
@@ -275,4 +306,4 @@ while ($running) {
 if (file_exists($socketPath)) {
     unlink($socketPath);
 }
-echo "[PHP Worker] Shutting down gracefully.\n";
+bakpia_log("[PHP Worker] Shutting down gracefully.");

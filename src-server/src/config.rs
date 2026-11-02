@@ -15,9 +15,60 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     pub security: SecurityConfig,
     pub compression: CompressionConfig,
+    #[serde(default)]
+    pub anti_oom: AntiOomConfig,
     pub pools: Vec<PoolConfig>,
     pub queue: QueueConfig,
     pub db_proxy: DbProxyConfig, 
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AntiOomConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_anti_oom_check_interval_ms")]
+    pub check_interval_ms: u64,
+    #[serde(default = "default_worker_threshold_percent")]
+    pub worker_threshold_percent: u64,
+    #[serde(default = "default_cgroup_threshold_percent")]
+    pub cgroup_threshold_percent: u64,
+    #[serde(default = "default_cgroup_memory_current_path")]
+    pub cgroup_memory_current_path: String,
+    #[serde(default = "default_cgroup_memory_max_path")]
+    pub cgroup_memory_max_path: String,
+}
+
+impl Default for AntiOomConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_ms: default_anti_oom_check_interval_ms(),
+            worker_threshold_percent: default_worker_threshold_percent(),
+            cgroup_threshold_percent: default_cgroup_threshold_percent(),
+            cgroup_memory_current_path: default_cgroup_memory_current_path(),
+            cgroup_memory_max_path: default_cgroup_memory_max_path(),
+        }
+    }
+}
+
+fn default_anti_oom_check_interval_ms() -> u64 {
+    1000
+}
+
+fn default_worker_threshold_percent() -> u64 {
+    80
+}
+
+fn default_cgroup_threshold_percent() -> u64 {
+    85
+}
+
+fn default_cgroup_memory_current_path() -> String {
+    "/sys/fs/cgroup/memory.current".to_string()
+}
+
+fn default_cgroup_memory_max_path() -> String {
+    "/sys/fs/cgroup/memory.max".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -159,6 +210,10 @@ pub struct PhpConfig {
     pub rolling_restart_delay_ms: u64,
     #[serde(default = "default_content_type")]
     pub default_content_type: String,
+    #[serde(default = "default_disable_functions")]
+    pub disable_functions: String,
+    #[serde(default = "default_true")]
+    pub open_basedir_docroot: bool,
 }
 
 fn default_php_binary() -> String {
@@ -183,6 +238,10 @@ fn default_rolling_restart_delay_ms() -> u64 {
 
 fn default_content_type() -> String {
     "text/html; charset=utf-8".to_string()
+}
+
+fn default_disable_functions() -> String {
+    "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]

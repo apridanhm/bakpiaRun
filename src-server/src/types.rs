@@ -41,6 +41,25 @@ pub struct PhpResponse {
     pub body: String,
     pub memory: u64,
     pub peak: u64,
+    #[serde(default, deserialize_with = "deserialize_headers_map_or_seq")]
+    pub headers: HashMap<String, String>,
+}
+
+fn deserialize_headers_map_or_seq<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MapOrSeq {
+        Map(HashMap<String, String>),
+        Seq(#[allow(dead_code)] Vec<serde_json::Value>),
+    }
+
+    match MapOrSeq::deserialize(deserializer)? {
+        MapOrSeq::Map(m) => Ok(m),
+        MapOrSeq::Seq(_) => Ok(HashMap::new()),
+    }
 }
 
 #[derive(Clone)]

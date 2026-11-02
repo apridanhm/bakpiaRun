@@ -18,11 +18,17 @@ pub async fn admin_auth_middleware(
         return Ok(next.run(req).await);
     }
     
-    // Get token from header
+    // Get token from X-Admin-Token or Authorization: Bearer <token>
     let provided_token = req
         .headers()
         .get("X-Admin-Token")
         .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            req.headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.strip_prefix("Bearer ").unwrap_or(s).trim())
+        })
         .unwrap_or("");
     
     // Validate

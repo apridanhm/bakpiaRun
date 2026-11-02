@@ -24,6 +24,9 @@ php:
   worker_startup_delay_ms: 500
   rolling_restart_delay_ms: 200
   default_content_type: "text/html; charset=utf-8"
+  # Anti-PHP2Shell (CVE-2026-109618 / CVE-2026-109619) Hardening
+  disable_functions: "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
+  open_basedir_docroot: true
 
 socket:
   directory: "/tmp/bakpiarun"
@@ -69,6 +72,15 @@ compression:
   enabled: true
   min_size_bytes: 1024  # Hanya compress response > 1KB
   level: 6  # 1-9 (6 = balanced)
+
+# Proactive Anti-OOM Engine (/proc/[pid]/status + cgroups v2 + Graceful Worker Recycling)
+anti_oom:
+  enabled: true
+  check_interval_ms: 1000
+  worker_threshold_percent: 80   # Graceful recycle worker saat VmRSS/Peak mencapai 80% memory_limit_mb pool
+  cgroup_threshold_percent: 85   # Proactive recycle worker terberat saat cgroups v2 memory mencapai 85%
+  cgroup_memory_current_path: "/sys/fs/cgroup/memory.current"
+  cgroup_memory_max_path: "/sys/fs/cgroup/memory.max"
 
 pools:
   # HEAVY POOL DULU (lebih spesifik)
