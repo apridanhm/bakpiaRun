@@ -1,5 +1,5 @@
 use mysql_async::prelude::*;
-use mysql_async::{Opts, Pool};
+use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::config::Config;
@@ -46,7 +46,14 @@ impl DbProxy {
         );
         
         let opts = Opts::from_url(&url)?;
-        let pool = Pool::new(opts);
+        let constraints = PoolConstraints::new(
+            db_config.pool.min_connections,
+            db_config.pool.max_connections,
+        )
+        .unwrap_or_default();
+        let pool_opts = PoolOpts::default().with_constraints(constraints);
+        let builder = OptsBuilder::from_opts(opts).pool_opts(pool_opts);
+        let pool = Pool::new(builder);
         
         let mut server_version = db_config.spoof_version.clone();
         

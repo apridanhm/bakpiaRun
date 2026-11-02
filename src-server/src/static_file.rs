@@ -72,7 +72,7 @@ pub fn is_static_file(path: &str) -> bool {
 }
 
 // Serve static file
-pub async fn serve_static_file(docroot: &str, uri: &str) -> Response<Body> {
+pub async fn serve_static_file(docroot: &str, uri: &str, cache_max_age: u64) -> Response<Body> {
     // Sanitize path (prevent directory traversal)
     let clean_path = uri.trim_start_matches('/');
     if clean_path.contains("..") {
@@ -111,21 +111,26 @@ pub async fn serve_static_file(docroot: &str, uri: &str) -> Response<Body> {
         .unwrap_or("");
     let mime_type = get_mime_type(extension);
     
-    // Calculate ETag (simple hash based on file size + modification time)
+    // Calculate ETag and Last-Modified from file metadata
     let metadata = fs::metadata(path).await.unwrap();
-    let etag = format!(
-        "\"{}-{}\"",
-        metadata.len(),
-        metadata.modified().unwrap().elapsed().unwrap().as_secs()
-    );
+    let modified_time = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let modified_secs = modified_time
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let etag = format!("\"{}-{}\"", metadata.len(), modified_secs);
+    let last_modified = chrono::DateTime::<chrono::Utc>::from(modified_time)
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let cache_control = format!("public, max-age={}", cache_max_age);
     
     // Build response with caching headers
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime_type)
-        .header(header::CACHE_CONTROL, "public, max-age=31536000") // 1 year
+        .header(header::CACHE_CONTROL, cache_control)
         .header(header::ETAG, etag)
-        .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT") // Placeholder
+        .header(header::LAST_MODIFIED, last_modified)
         .body(Body::from(content))
         .unwrap()
 }

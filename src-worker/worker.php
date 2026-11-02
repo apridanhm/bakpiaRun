@@ -17,6 +17,12 @@ pcntl_signal(SIGINT, function() use (&$running) {
 pcntl_signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE
 
 $socketPath = getenv('BAKPIARUN_SOCKET_PATH') ?: '/tmp/bakpiarun.sock';
+$timeoutSec = (float)(getenv('BAKPIARUN_TIMEOUT_SEC') ?: 30.0);
+$maxPayloadMb = (int)(getenv('BAKPIARUN_MAX_PAYLOAD_MB') ?: 100);
+$maxPayloadBytes = $maxPayloadMb * 1024 * 1024;
+$defaultServerHost = getenv('BAKPIARUN_SERVER_HOST') ?: 'localhost';
+$defaultServerPort = getenv('BAKPIARUN_SERVER_PORT') ?: '8080';
+
 $socketDir = dirname($socketPath);
 
 if (!is_dir($socketDir)) {
@@ -43,7 +49,7 @@ while ($running) {
             continue;
         }
 
-        stream_set_timeout($client, 30.0); // 30 detik timeout
+        stream_set_timeout($client, (int)$timeoutSec);
         stream_set_blocking($client, true);
 
         // Baca length header (4 bytes)
@@ -56,9 +62,9 @@ while ($running) {
 
         $payloadLength = unpack('N', $lengthHeader)[1];
         
-        // Sanity check: jangan terima payload > 100MB
-        if ($payloadLength > 100 * 1024 * 1024) {
-            echo "[PHP Worker] Payload too large: {$payloadLength} bytes\n";
+        // Sanity check: jangan terima payload melebihi batas config
+        if ($payloadLength > $maxPayloadBytes) {
+            echo "[PHP Worker] Payload too large: {$payloadLength} bytes (max: {$maxPayloadBytes})\n";
             fclose($client);
             continue;
         }
@@ -102,22 +108,36 @@ while ($running) {
         echo "[PHP Worker] Handling request: " . ($request['method'] ?? '?') . " " . ($request['uri'] ?? '?') . "\n";
 
         // --- INJECT SUPERGLOBALS ---
+        $docroot = getcwd();
+        $reqUri = $request['uri'] ?? '/';
+        $uri_parts = parse_url($reqUri);
+        $uriPath = $uri_parts['path'] ?? '/';
+        $filePath = $request['file_path'] ?? '';
+        $scriptName = $uriPath;
+        if ($filePath && str_starts_with($filePath, $docroot)) {
+            $scriptName = substr($filePath, strlen($docroot));
+        }
+
+        $hostHeader = $request['headers']['host'] ?? "{$defaultServerHost}:{$defaultServerPort}";
+        $hostParts = explode(':', $hostHeader);
+        $serverName = $hostParts[0] ?: $defaultServerHost;
+        $serverPort = $hostParts[1] ?? $defaultServerPort;
+
         $_SERVER = [];
-        $_SERVER['REQUEST_METHOD'] = $request['method'] ?? 'GET';
-        $_SERVER['REQUEST_URI']    = $request['uri'] ?? '/';
-        $_SERVER['SERVER_NAME']    = 'localhost';
-        $_SERVER['SERVER_PORT']    = '8080';
+        $_SERVER['REQUEST_METHOD']  = $request['method'] ?? 'GET';
+        $_SERVER['REQUEST_URI']     = $reqUri;
+        $_SERVER['SERVER_NAME']     = $serverName;
+        $_SERVER['SERVER_PORT']     = $serverPort;
         $_SERVER['SERVER_PROTOCOL'] = 'HTTP/1.1';
-        $_SERVER['HTTP_HOST']      = 'localhost:8080';
-        $_SERVER['SCRIPT_NAME']    = '/index.php';
-        $_SERVER['PHP_SELF']       = '/index.php';
-        $_SERVER['QUERY_STRING']   = $request['query_string'] ?? '';
-        $_SERVER['CONTENT_TYPE']   = $request['content_type'] ?? '';
-        $_SERVER['CONTENT_LENGTH'] = $request['content_length'] ?? '0';
-        $_SERVER['DOCUMENT_ROOT']  = getcwd();
-        
-        $uri_parts = parse_url($request['uri'] ?? '/');
-        $_SERVER['PATH_INFO'] = $uri_parts['path'] ?? '/';
+        $_SERVER['HTTP_HOST']       = $hostHeader;
+        $_SERVER['SCRIPT_NAME']     = $scriptName;
+        $_SERVER['PHP_SELF']        = $scriptName;
+        $_SERVER['SCRIPT_FILENAME'] = $filePath;
+        $_SERVER['QUERY_STRING']    = $request['query_string'] ?? '';
+        $_SERVER['CONTENT_TYPE']    = $request['content_type'] ?? '';
+        $_SERVER['CONTENT_LENGTH']  = $request['content_length'] ?? '0';
+        $_SERVER['DOCUMENT_ROOT']   = $docroot;
+        $_SERVER['PATH_INFO']       = $uriPath;
         
         if (isset($request['headers']) && is_array($request['headers'])) {
             foreach ($request['headers'] as $key => $value) {

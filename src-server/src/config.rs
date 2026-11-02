@@ -5,6 +5,8 @@ use std::fs;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    #[serde(skip)]
+    pub config_path: String,
     pub server: ServerConfig,
     pub php: PhpConfig,
     pub socket: SocketConfig,
@@ -21,9 +23,9 @@ pub struct Config {
 pub struct PoolConfig {
     pub name: String,
     pub worker_count: usize,
-    //pub memory_limit_mb: u64,
-    //pub max_requests: u64,
-    //pub timeout_ms: u64,
+    pub memory_limit_mb: Option<u64>,
+    pub max_requests: Option<u64>,
+    pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub patterns: Vec<String>,
 }
@@ -34,6 +36,8 @@ pub struct QueueConfig {
     pub enabled: bool,
     #[serde(default = "default_queue_max_jobs")]
     pub max_jobs: usize,
+    #[serde(default = "default_queue_poll_interval_ms")]
+    pub poll_interval_ms: u64,
 }
 
 fn default_true() -> bool {
@@ -42,6 +46,10 @@ fn default_true() -> bool {
 
 fn default_queue_max_jobs() -> usize {
     10000
+}
+
+fn default_queue_poll_interval_ms() -> u64 {
+    500
 }
 
 
@@ -113,10 +121,24 @@ pub struct ServerConfig {
     pub https_port: u16,
     pub tls: TlsConfig,
     pub admin_token: Option<String>,
+    #[serde(default = "default_max_body_size_mb")]
+    pub max_body_size_mb: usize,
+    #[serde(default = "default_static_cache_max_age")]
+    pub static_cache_max_age: u64,
+}
+
+fn default_max_body_size_mb() -> usize {
+    50
+}
+
+fn default_static_cache_max_age() -> u64 {
+    31536000
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PhpConfig {
+    #[serde(default = "default_php_binary")]
+    pub binary_path: String,
     pub docroot: String,
     pub worker_path: String,
     pub worker_count: usize,
@@ -124,6 +146,40 @@ pub struct PhpConfig {
     pub max_requests: u64,
     pub timeout_ms: u64,
     pub connection_pool_size: usize,
+    #[serde(default = "default_upload_tmp_dir")]
+    pub upload_tmp_dir: String,
+    #[serde(default = "default_max_payload_mb")]
+    pub max_payload_mb: usize,
+    #[serde(default = "default_worker_startup_delay_ms")]
+    pub worker_startup_delay_ms: u64,
+    #[serde(default = "default_rolling_restart_delay_ms")]
+    pub rolling_restart_delay_ms: u64,
+    #[serde(default = "default_content_type")]
+    pub default_content_type: String,
+}
+
+fn default_php_binary() -> String {
+    "php".to_string()
+}
+
+fn default_upload_tmp_dir() -> String {
+    "/tmp/bakpiarun_uploads".to_string()
+}
+
+fn default_max_payload_mb() -> usize {
+    100
+}
+
+fn default_worker_startup_delay_ms() -> u64 {
+    500
+}
+
+fn default_rolling_restart_delay_ms() -> u64 {
+    200
+}
+
+fn default_content_type() -> String {
+    "text/html; charset=utf-8".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -152,8 +208,9 @@ impl Config {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file: {}", e))?;
         
-        let config: Config = serde_yaml::from_str(&content)
+        let mut config: Config = serde_yaml::from_str(&content)
             .map_err(|e| format!("Failed to parse config: {}", e))?;
+        config.config_path = path.to_string();
         
         Ok(config)
     }
@@ -172,6 +229,10 @@ impl Config {
         
         if let Ok(docroot) = env::var("BAKPIARUN_DOCROOT") {
             self.php.docroot = docroot;
+        }
+
+        if let Ok(binary_path) = env::var("BAKPIARUN_PHP_BINARY") {
+            self.php.binary_path = binary_path;
         }
         
         if let Ok(worker_count) = env::var("BAKPIARUN_WORKER_COUNT") {

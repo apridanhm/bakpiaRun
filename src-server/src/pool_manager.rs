@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::config::Config;
+use crate::config::{Config, PoolConfig};
 use crate::worker_pool::WorkerPool;
 
 pub struct PoolManager {
@@ -10,6 +10,23 @@ pub struct PoolManager {
 }
 
 impl PoolManager {
+    pub fn build_pool_config(config: &Config, pool_config: &PoolConfig) -> Config {
+        let pool_socket_dir = format!("{}/{}", config.socket.directory, pool_config.name);
+        let mut pool_specific_config = config.clone();
+        pool_specific_config.socket.directory = pool_socket_dir;
+        pool_specific_config.php.worker_count = pool_config.worker_count;
+        if let Some(mem) = pool_config.memory_limit_mb {
+            pool_specific_config.php.memory_limit_mb = mem;
+        }
+        if let Some(max_req) = pool_config.max_requests {
+            pool_specific_config.php.max_requests = max_req;
+        }
+        if let Some(timeout) = pool_config.timeout_ms {
+            pool_specific_config.php.timeout_ms = timeout;
+        }
+        pool_specific_config
+    }
+
     pub async fn new(config: &Config) -> Self {
         let mut pools = HashMap::new();
         let mut routing_table = Vec::new();
@@ -23,14 +40,11 @@ impl PoolManager {
             println!("[PoolManager] Initializing pool '{}' with {} workers...", 
                      pool_config.name, pool_config.worker_count);
             
-            // Create pool-specific socket directory
-            let pool_socket_dir = format!("{}/{}", config.socket.directory, pool_config.name);
-            std::fs::create_dir_all(&pool_socket_dir)
-                .expect(&format!("Failed to create socket directory for pool '{}'", pool_config.name));
+            let pool_specific_config = Self::build_pool_config(config, pool_config);
             
-            // Create pool-specific config
-            let mut pool_specific_config = config.clone();
-            pool_specific_config.socket.directory = pool_socket_dir;
+            // Create pool-specific socket directory
+            std::fs::create_dir_all(&pool_specific_config.socket.directory)
+                .expect(&format!("Failed to create socket directory for pool '{}'", pool_config.name));
             
             let mut pool = WorkerPool::new(pool_config.worker_count, &pool_specific_config);
         

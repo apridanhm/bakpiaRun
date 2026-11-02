@@ -6,14 +6,36 @@
  */
 
 class BakpiaQueue {
-    private static $baseUrl = 'http://localhost:8080';
+    private static $baseUrl = null;
+    private static $adminToken = null;
     private static $timeout = 5;
     
+    private static function getBaseUrl() {
+        if (self::$baseUrl !== null) {
+            return self::$baseUrl;
+        }
+        return rtrim(getenv('BAKPIARUN_BASE_URL') ?: 'http://127.0.0.1:8080', '/');
+    }
+
+    private static function getAdminToken() {
+        if (self::$adminToken !== null) {
+            return self::$adminToken;
+        }
+        return getenv('BAKPIARUN_ADMIN_TOKEN') ?: '';
+    }
+
     /**
      * set base URL untuk queue API
      */
     public static function setBaseUrl($url) {
         self::$baseUrl = rtrim($url, '/');
+    }
+
+    /**
+     * set admin token untuk autentikasi queue API
+     */
+    public static function setAdminToken($token) {
+        self::$adminToken = $token;
     }
     
     /**
@@ -32,21 +54,27 @@ class BakpiaQueue {
      * @throws Exception jika request gagal
      */
     public static function push($task, $payload = []) {
-        $url = self::$baseUrl . '/api/queue/submit';
+        $url = self::getBaseUrl() . '/api/queue/submit';
         
         $data = [
             'task' => $task,
             'payload' => $payload
         ];
         
+        $headers = [
+            'Content-Type: application/json',
+            'Accept: application/json'
+        ];
+        $token = self::getAdminToken();
+        if (!empty($token)) {
+            $headers[] = 'X-Admin-Token: ' . $token;
+        }
+
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/json',
-            'Accept: application/json'
-        ]);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         curl_setopt($ch, CURLOPT_TIMEOUT, self::$timeout);
         
         $response = curl_exec($ch);
@@ -79,13 +107,19 @@ class BakpiaQueue {
      * @throws Exception jika job tidak ditemukan atau request gagal
      */
     public static function status($jobId) {
-        $url = self::$baseUrl . '/api/queue/status/' . urlencode($jobId);
+        $url = self::getBaseUrl() . '/api/queue/status/' . urlencode($jobId);
         
+        $headers = [
+            'Accept: application/json'
+        ];
+        $token = self::getAdminToken();
+        if (!empty($token)) {
+            $headers[] = 'X-Admin-Token: ' . $token;
+        }
+
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Accept: application/json'
-        ]);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         curl_setopt($ch, CURLOPT_TIMEOUT, self::$timeout);
         
         $response = curl_exec($ch);

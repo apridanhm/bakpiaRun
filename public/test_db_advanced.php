@@ -11,7 +11,7 @@ try {
         ]
     );
     
-    echo "✅ Connected!\n\n";
+    echo "Connected!\n\n";
     
     // Test 1: SELECT with WHERE
     echo "Test 1 - SELECT with WHERE:\n";
@@ -52,8 +52,8 @@ try {
     $users = $stmt->fetchAll(PDO::FETCH_ASSOC);
     echo json_encode($users, JSON_PRETTY_PRINT) . "\n\n";
     
-    echo "✅ All tests passed!\n";
+    echo "All tests passed!\n";
     
 } catch (PDOException $e) {
-    echo "❌ Error: " . $e->getMessage() . "\n";
+    echo "Error: " . $e->getMessage() . "\n";
 }

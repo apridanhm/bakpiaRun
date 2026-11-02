@@ -90,7 +90,7 @@ pub async fn php_handler(
     if static_file::is_static_file(path) {
         println!("[Static] Serving: {}", path);
         state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 200, 0);
-        return static_file::serve_static_file(&config.php.docroot, path).await;
+        return static_file::serve_static_file(&config.php.docroot, path, config.server.static_cache_max_age).await;
     }
     
     let file_path = match static_file::find_php_file(&config.php.docroot, path).await {
@@ -124,12 +124,12 @@ pub async fn php_handler(
     };
     println!("[Router] {} → Pool: {}", path, pool_name);
 
-    // Ambil worker dari pool yang dipilih
-    let worker_index = {
+    // Ambil worker dari pool yang dipilih beserta pool_config
+    let (worker_index, pool_config) = {
         let pm = state.pool_manager.lock().await;
         let pool_arc = pm.get_pool(&pool_name).unwrap();
         let pool = pool_arc.lock().await;
-        pool.get_next_worker()
+        (pool.get_next_worker(), pool.config.clone())
     };
 
     // Ensure worker running
@@ -138,7 +138,7 @@ pub async fn php_handler(
         let pool_arc = pm.get_pool(&pool_name).unwrap();
         let mut pool = pool_arc.lock().await;
         if let Some(worker) = pool.workers.get_mut(worker_index) {
-            if let Err(e) = worker.ensure_running(&config).await {
+            if let Err(e) = worker.ensure_running(&pool_config).await {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 state.logger.log_error("ERROR", &format!("Worker #{} in pool '{}' failed to start: {} (URI: {})", worker_index, pool_name, e, uri));
                 state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
@@ -170,7 +170,8 @@ pub async fn php_handler(
         }
     }
 
-    let body_bytes = match axum::body::to_bytes(body, 50 * 1024 * 1024).await {
+    let max_body_bytes = config.server.max_body_size_mb * 1024 * 1024;
+    let body_bytes = match axum::body::to_bytes(body, max_body_bytes).await {
         Ok(b) => b,
         Err(e) => {
             let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -214,9 +215,9 @@ pub async fn php_handler(
                 
                 if is_file {
                     if let Some(fname) = filename {
-                        let upload_dir = "/tmp/bakpiarun_uploads/";
+                        let upload_dir = config.php.upload_tmp_dir.trim_end_matches('/');
                         let _ = std::fs::create_dir_all(upload_dir);
-                        let temp_path = format!("{}{}", upload_dir, format!("{}", uuid::Uuid::new_v4()));
+                        let temp_path = format!("{}/{}", upload_dir, uuid::Uuid::new_v4());
                         
                         match std::fs::File::create(&temp_path) {
                             Ok(mut file) => {
@@ -308,8 +309,8 @@ pub async fn php_handler(
         (w.socket_path.clone(), w.connection_pool.clone(), w.pool_size)
     };
 
-    // WRAP DENGAN TIMEOUT
-    let timeout_duration = std::time::Duration::from_millis(config.php.timeout_ms);
+    // WRAP DENGAN TIMEOUT (gunakan timeout dari pool yang dipilih)
+    let timeout_duration = std::time::Duration::from_millis(pool_config.php.timeout_ms);
     let result = tokio::time::timeout(
         timeout_duration, 
         send_to_php_worker(&socket_path, &conn_pool, pool_size, request)
@@ -346,7 +347,7 @@ pub async fn php_handler(
                         php_response.memory / 1024 / 1024,
                         php_response.peak / 1024 / 1024
                     );
-                    worker.should_restart(&config)
+                    worker.should_restart(&pool_config)
                 } else {
                     None
                 }
@@ -365,7 +366,7 @@ pub async fn php_handler(
 
             let mut response = axum::http::Response::builder()
                 .status(StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK))
-                .header("Content-Type", "text/html; charset=utf-8");
+                .header("Content-Type", &config.php.default_content_type);
 
             let config = state.config.lock().await;
             response = apply_security_headers(response, &config.security);
@@ -401,7 +402,7 @@ pub async fn php_handler(
                 let pool_arc = pm.get_pool(&pool_name).unwrap();
                 let mut pool = pool_arc.lock().await;
                 if let Some(worker) = pool.workers.get_mut(worker_index) {
-                    let _ = worker.ensure_running(&config).await;
+                    let _ = worker.ensure_running(&pool_config).await;
                 }
             }
             (
@@ -413,7 +414,7 @@ pub async fn php_handler(
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_error(
                 "ERROR",
-                &format!("Request timeout after {}ms (URI: {})", config.php.timeout_ms, uri),
+                &format!("Request timeout after {}ms (URI: {})", pool_config.php.timeout_ms, uri),
             );
             state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 504, duration_ms);
 
@@ -436,7 +437,7 @@ pub async fn php_handler(
                 StatusCode::GATEWAY_TIMEOUT,
                 Html(format!(
                     "<h1>504 Gateway Timeout</h1><p>The server did not receive a timely response from the PHP worker.</p><p>Timeout: {}ms</p>",
-                    config.php.timeout_ms
+                    pool_config.php.timeout_ms
                 )),
             ).into_response()
         }
@@ -558,9 +559,14 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response {
 pub async fn reload_handler(State(state): State<AppState>) -> Response {
     println!("[Reload] HTTP reload triggered");
     
-    let config_path = std::env::current_dir()
-        .map(|p| p.join("../config/bakpiarun.yaml").to_string_lossy().to_string())
-        .unwrap_or_else(|_| "../config/bakpiarun.yaml".to_string());
+    let config_path = {
+        let current_config = state.config.lock().await;
+        if !current_config.config_path.is_empty() {
+            current_config.config_path.clone()
+        } else {
+            "../config/bakpiarun.yaml".to_string()
+        }
+    };
     
     let mut new_config = match Config::load_from_file(&config_path) {
         Ok(c) => c,
@@ -596,14 +602,19 @@ pub async fn reload_handler(State(state): State<AppState>) -> Response {
         *config = new_config.clone();
     }
     
-    // reload semua pools
+    // reload semua pools menggunakan konfigurasi spesifik masing-masing pool
     let pm = state.pool_manager.lock().await;
     let mut reload_results = Vec::new();
     
     for (name, pool_arc) in &pm.pools {
         println!("[Reload] Reloading pool '{}'...", name);
+        let pool_specific_config = if let Some(pc) = new_config.pools.iter().find(|p| &p.name == name) {
+            crate::pool_manager::PoolManager::build_pool_config(&new_config, pc)
+        } else {
+            new_config.clone()
+        };
         let mut pool = pool_arc.lock().await;
-        match pool.reload(&new_config).await {
+        match pool.reload(&pool_specific_config).await {
             Ok(_) => reload_results.push(format!("Pool '{}': OK", name)),
             Err(e) => {
                 eprintln!("[Reload] Failed to reload pool '{}': {}", name, e);
