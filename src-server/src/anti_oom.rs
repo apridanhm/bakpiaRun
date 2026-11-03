@@ -213,7 +213,7 @@ impl AntiOomEngine {
 
                 if cgroup_pressure {
                     println!(
-                        "[Anti-OOM Engine] ⚠️ Container cgroups v2 memory pressure detected: {:.1}% ({} MB / {} MB, threshold: {}%)",
+                        "[Anti-OOM Engine] Container cgroups v2 memory pressure detected: {:.1}% ({} MB / {} MB, threshold: {}%)",
                         cgroup_mem.usage_percent,
                         cgroup_mem.current_bytes / 1024 / 1024,
                         cgroup_mem.max_bytes / 1024 / 1024,

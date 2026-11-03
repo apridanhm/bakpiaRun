@@ -1,5 +1,5 @@
 <?php
 // Sleep 35 detik (lebih dari timeout 30 detik)
-sleep(35);
+sleep(20);
 echo "This should not appear";
 ?>
