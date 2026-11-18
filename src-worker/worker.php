@@ -1,5 +1,5 @@
 <?php
-// src-worker/worker.php - High-Performance Persistent Keep-Alive & Isolated Scope Worker
+// src-worker/worker.php - High-Performance Persistent Keep-Alive & Modern Framework Worker
 
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
@@ -17,23 +17,112 @@ function bakpia_debug(string $msg): void {
     }
 }
 
-// Helper bagi aplikasi PHP di mode CLI jika ingin menambahkan custom response header
+// State per-request untuk response headers, Set-Cookie multi-value, dan raw HTTP body
 $GLOBALS['__BAKPIARUN_HEADERS'] = [];
+$GLOBALS['__BAKPIARUN_COOKIES'] = [];
+$GLOBALS['__BAKPIARUN_RAW_BODY'] = '';
+
+/**
+ * Mengambil raw HTTP request body (untuk JSON REST API PUT/PATCH/POST/DELETE di mode CLI).
+ */
+function bakpiarun_raw_body(): string {
+    return $GLOBALS['__BAKPIARUN_RAW_BODY'] ?? '';
+}
+
+/**
+ * Helper decode JSON request body langsung menjadi associative array.
+ */
+function bakpiarun_json_body(): array {
+    $raw = $GLOBALS['__BAKPIARUN_RAW_BODY'] ?? '';
+    if ($raw === '') {
+        return [];
+    }
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+/**
+ * CLI-compatible pengganti header() yang mendukung Location redirect (auto 302) & multi Set-Cookie.
+ */
 function bakpiarun_header(string $header_line, bool $replace = true, int $response_code = 0): void {
     if ($response_code > 0) {
         http_response_code($response_code);
     }
+
+    if (str_starts_with(strtoupper($header_line), 'HTTP/')) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $header_line, $m)) {
+            http_response_code((int)$m[1]);
+        }
+        return;
+    }
+
     $parts = explode(':', $header_line, 2);
-    if (count($parts) === 2) {
-        $GLOBALS['__BAKPIARUN_HEADERS'][trim($parts[0])] = trim($parts[1]);
+    if (count($parts) !== 2) {
+        return;
+    }
+
+    $name = trim($parts[0]);
+    $value = trim($parts[1]);
+    $lower = strtolower($name);
+
+    if ($lower === 'set-cookie') {
+        if ($replace) {
+            $GLOBALS['__BAKPIARUN_COOKIES'] = [$value];
+        } else {
+            $GLOBALS['__BAKPIARUN_COOKIES'][] = $value;
+        }
+        return;
+    }
+
+    if ($lower === 'location' && $response_code === 0 && http_response_code() === 200) {
+        http_response_code(302);
+    }
+
+    if (!$replace && isset($GLOBALS['__BAKPIARUN_HEADERS'][$name])) {
+        $GLOBALS['__BAKPIARUN_HEADERS'][$name] .= ', ' . $value;
+    } else {
+        $GLOBALS['__BAKPIARUN_HEADERS'][$name] = $value;
     }
 }
 
 /**
- * Isolated Static Closure Sandbox:
- * Menjalankan file PHP target di luar scope variabel internal worker.php
- * sehingga variabel lokal skrip (misal $massiveData) langsung dibebaskan
- * dari memori begitu request selesai dan tidak bocor ke request berikutnya.
+ * CLI-compatible pengganti setcookie() sesuai RFC 6265.
+ */
+function bakpiarun_setcookie(
+    string $name,
+    string $value = '',
+    int $expires = 0,
+    string $path = '/',
+    string $domain = '',
+    bool $secure = false,
+    bool $httponly = false,
+    string $samesite = 'Lax'
+): void {
+    $cookie = rawurlencode($name) . '=' . rawurlencode($value);
+    if ($expires > 0) {
+        $cookie .= '; Expires=' . gmdate('D, d M Y H:i:s T', $expires);
+        $cookie .= '; Max-Age=' . max(0, $expires - time());
+    }
+    if ($path !== '') {
+        $cookie .= '; Path=' . $path;
+    }
+    if ($domain !== '') {
+        $cookie .= '; Domain=' . $domain;
+    }
+    if ($secure) {
+        $cookie .= '; Secure';
+    }
+    if ($httponly) {
+        $cookie .= '; HttpOnly';
+    }
+    if ($samesite !== '') {
+        $cookie .= '; SameSite=' . $samesite;
+    }
+    $GLOBALS['__BAKPIARUN_COOKIES'][] = $cookie;
+}
+
+/**
+ * Isolated Static Closure Sandbox untuk PHP Native / Micro-frameworks
  */
 $__bakpiaRunIsolated = static function (string $__bakpia_target_file): void {
     include $__bakpia_target_file;
@@ -66,7 +155,6 @@ if (file_exists($socketPath)) {
     unlink($socketPath);
 }
 
-// Backlog 1024 untuk keamanan saat lonjakan koneksi
 $context = stream_context_create([
     'socket' => [
         'backlog' => 1024,
@@ -83,9 +171,26 @@ if (!$server) {
     die("Gagal membuat socket: {$errstr} ({$errno})\n");
 }
 
-bakpia_log("[PHP Worker] Listening on unix://{$socketPath} (PID: " . getmypid() . ")");
-
 $docroot = getcwd();
+$frontIndexPath = realpath($docroot . '/index.php') ?: ($docroot . '/index.php');
+$projectRoot = dirname($docroot);
+
+// Deteksi 1x di awal (0% overhead di hot-path jika bukan Laravel!)
+$laravelBridge = null;
+$isLaravelApp = is_file($projectRoot . '/artisan')
+    && is_file($projectRoot . '/vendor/autoload.php')
+    && is_file($projectRoot . '/bootstrap/app.php');
+
+if ($isLaravelApp) {
+    $bridgeFile = __DIR__ . '/../lib/BakpiaLaravelBridge.php';
+    if (is_file($bridgeFile)) {
+        require_once $bridgeFile;
+        $laravelBridge = new BakpiaLaravelBridge($projectRoot);
+        bakpia_log("[PHP Worker] Laravel application detected at {$projectRoot} (Persistent Bridge Ready)");
+    }
+}
+
+bakpia_log("[PHP Worker] Listening on unix://{$socketPath} (PID: " . getmypid() . ")");
 
 while ($running) {
     try {
@@ -97,8 +202,6 @@ while ($running) {
         stream_set_timeout($client, max(1, (int)$timeoutSec));
         stream_set_blocking($client, true);
 
-        // Inner Persistent Keep-Alive Loop:
-        // Melayani ribuan request secara berurutan di satu pipa UDS tanpa overhead connect/close
         while ($running && is_resource($client)) {
             $read = [$client];
             $write = null;
@@ -126,7 +229,6 @@ while ($running) {
             }
 
             if ($lengthHeader === '') {
-                // Koneksi ditutup bersih (EOF) oleh Rust
                 break;
             }
 
@@ -168,14 +270,15 @@ while ($running) {
                 break;
             }
 
-            bakpia_debug("[PHP Worker] Handling request: " . ($request['method'] ?? '?') . " " . ($request['uri'] ?? '?'));
+            $method = $request['method'] ?? 'GET';
+            $reqUri = $request['uri'] ?? '/';
+            bakpia_debug("[PHP Worker] Handling request: {$method} {$reqUri}");
 
-            // 3. Reset peak memory per-request (PHP 8.2+) & bersihkan state superglobal
+            // 3. Reset peak memory per-request & siapkan superglobals
             if (function_exists('memory_reset_peak_usage')) {
                 memory_reset_peak_usage();
             }
 
-            $reqUri = $request['uri'] ?? '/';
             $uriParts = parse_url($reqUri);
             $uriPath = $uriParts['path'] ?? '/';
             $filePath = $request['file_path'] ?? '';
@@ -188,22 +291,28 @@ while ($running) {
             $hostParts = explode(':', $hostHeader);
             $serverName = $hostParts[0] ?: $defaultServerHost;
             $serverPort = $hostParts[1] ?? $defaultServerPort;
+            $rawBody = (string)($request['body'] ?? '');
+            $GLOBALS['__BAKPIARUN_RAW_BODY'] = $rawBody;
 
             $_SERVER = [
-                'REQUEST_METHOD'  => $request['method'] ?? 'GET',
-                'REQUEST_URI'     => $reqUri,
-                'SERVER_NAME'     => $serverName,
-                'SERVER_PORT'     => $serverPort,
-                'SERVER_PROTOCOL' => 'HTTP/1.1',
-                'HTTP_HOST'       => $hostHeader,
-                'SCRIPT_NAME'     => $scriptName,
-                'PHP_SELF'        => $scriptName,
-                'SCRIPT_FILENAME' => $filePath,
-                'QUERY_STRING'    => $request['query_string'] ?? '',
-                'CONTENT_TYPE'    => $request['content_type'] ?? '',
-                'CONTENT_LENGTH'  => $request['content_length'] ?? '0',
-                'DOCUMENT_ROOT'   => $docroot,
-                'PATH_INFO'       => $uriPath,
+                'REQUEST_METHOD'     => $method,
+                'REQUEST_URI'        => $reqUri,
+                'SERVER_NAME'        => $serverName,
+                'SERVER_PORT'        => $serverPort,
+                'SERVER_PROTOCOL'    => 'HTTP/1.1',
+                'HTTP_HOST'          => $hostHeader,
+                'SCRIPT_NAME'        => $scriptName,
+                'PHP_SELF'           => $scriptName,
+                'SCRIPT_FILENAME'    => $filePath,
+                'QUERY_STRING'       => $request['query_string'] ?? '',
+                'CONTENT_TYPE'       => $request['content_type'] ?? '',
+                'HTTP_CONTENT_TYPE'  => $request['content_type'] ?? '',
+                'CONTENT_LENGTH'     => $request['content_length'] ?? '0',
+                'HTTP_CONTENT_LENGTH'=> $request['content_length'] ?? '0',
+                'DOCUMENT_ROOT'      => $docroot,
+                'PATH_INFO'          => $uriPath,
+                'REQUEST_TIME'       => time(),
+                'REQUEST_TIME_FLOAT' => microtime(true),
             ];
 
             if (isset($request['headers']) && is_array($request['headers'])) {
@@ -260,61 +369,93 @@ while ($running) {
                     }
                 }
             }
+            unset($request);
 
-            $bodyContent = $request['body'] ?? '';
-            if ($bodyContent !== '') {
-                file_put_contents('php://temp', $bodyContent);
-            }
-            unset($request, $bodyContent);
-
-            // 4. Eksekusi skrip di dalam Isolated Static Closure
+            // 4. Eksekusi: Jalur Persistent Laravel Bridge ATAU Jalur Cepat Isolated Closure
             $GLOBALS['__BAKPIARUN_HEADERS'] = [];
-            http_response_code(200);
-            if (function_exists('header_remove')) {
-                @header_remove();
-            }
+            $GLOBALS['__BAKPIARUN_COOKIES'] = [];
 
-            $baseObLevel = ob_get_level();
-            ob_start();
-
-            $status = 200;
-            try {
-                if ($filePath !== '' && file_exists($filePath)) {
-                    $__bakpiaRunIsolated($filePath);
-                    $code = http_response_code();
-                    if (is_int($code) && $code >= 100 && $code <= 599) {
-                        $status = $code;
-                    }
-                } else {
-                    $status = 404;
-                    echo "<h1>404 Not Found</h1><p>File tidak ditemukan: " . htmlspecialchars($filePath) . "</p>";
+            $resolvedTarget = ($filePath !== '') ? (realpath($filePath) ?: $filePath) : '';
+            if ($laravelBridge !== null && $resolvedTarget === $frontIndexPath) {
+                try {
+                    $laravelResult = $laravelBridge->handle(
+                        $reqUri,
+                        $method,
+                        $_GET,
+                        $_POST,
+                        $_COOKIE,
+                        $_FILES,
+                        $_SERVER,
+                        $rawBody
+                    );
+                    $status = $laravelResult['status'];
+                    $respHeaders = $laravelResult['headers'];
+                    $respCookies = $laravelResult['cookies'];
+                    $body = $laravelResult['body'];
+                    unset($laravelResult);
+                } catch (Throwable $e) {
+                    $status = 500;
+                    $respHeaders = [];
+                    $respCookies = [];
+                    $body = "<h1>500 Laravel Worker Error</h1><p>" . htmlspecialchars($e->getMessage()) . "</p>";
                 }
-            } catch (Throwable $e) {
-                $status = 500;
-                echo "<h1>500 Error</h1><p>" . htmlspecialchars($e->getMessage()) . "</p>";
-            }
+            } else {
+                http_response_code(200);
+                if (function_exists('header_remove')) {
+                    @header_remove();
+                }
 
-            // Tutup output buffer nested jika skrip membuka ob_start() sendiri tanpa menutupnya
-            while (ob_get_level() > $baseObLevel + 1) {
-                ob_end_flush();
-            }
-            $body = (string)ob_get_clean();
+                $baseObLevel = ob_get_level();
+                ob_start();
 
-            $respHeaders = $GLOBALS['__BAKPIARUN_HEADERS'];
-            if (function_exists('headers_list')) {
-                foreach (headers_list() as $rawHeader) {
-                    $parts = explode(':', $rawHeader, 2);
-                    if (count($parts) === 2) {
-                        $respHeaders[trim($parts[0])] = trim($parts[1]);
+                $status = 200;
+                try {
+                    if ($filePath !== '' && file_exists($filePath)) {
+                        $__bakpiaRunIsolated($filePath);
+                        $code = http_response_code();
+                        if (is_int($code) && $code >= 100 && $code <= 599) {
+                            $status = $code;
+                        }
+                    } else {
+                        $status = 404;
+                        echo "<h1>404 Not Found</h1><p>File tidak ditemukan: " . htmlspecialchars($filePath) . "</p>";
+                    }
+                } catch (Throwable $e) {
+                    $status = 500;
+                    echo "<h1>500 Error</h1><p>" . htmlspecialchars($e->getMessage()) . "</p>";
+                }
+
+                while (ob_get_level() > $baseObLevel + 1) {
+                    ob_end_flush();
+                }
+                $body = (string)ob_get_clean();
+
+                $respHeaders = $GLOBALS['__BAKPIARUN_HEADERS'];
+                $respCookies = $GLOBALS['__BAKPIARUN_COOKIES'];
+                if (function_exists('headers_list')) {
+                    foreach (headers_list() as $rawHeader) {
+                        $parts = explode(':', $rawHeader, 2);
+                        if (count($parts) === 2) {
+                            $hName = trim($parts[0]);
+                            $hVal = trim($parts[1]);
+                            if (strtolower($hName) === 'set-cookie') {
+                                $respCookies[] = $hVal;
+                            } else {
+                                $respHeaders[$hName] = $hVal;
+                            }
+                        }
                     }
                 }
             }
 
-            // Rekam peak memory selama eksekusi request, lalu bersihkan superglobals.
-            // Jika alokasi chunk ZendMM melewati 8 MB, jalankan GC + gc_mem_caches() agar RAM fisik (VmRSS) langsung dikembalikan ke kernel Linux!
+            // Rekam peak memory, bersihkan state request, & kembalikan chunk besar (>8MB) ke kernel
             $peakMemory = memory_get_peak_usage(true);
             $_GET = $_POST = $_COOKIE = $_REQUEST = $_FILES = [];
             $GLOBALS['__BAKPIARUN_HEADERS'] = [];
+            $GLOBALS['__BAKPIARUN_COOKIES'] = [];
+            $GLOBALS['__BAKPIARUN_RAW_BODY'] = '';
+            unset($rawBody);
+
             if (memory_get_usage(true) > 8388608) {
                 gc_collect_cycles();
                 if (function_exists('gc_mem_caches')) {
@@ -324,15 +465,22 @@ while ($running) {
             $currentMemory = memory_get_usage(true);
 
             // 5. Kirim response JSON utuh melalui persistent UDS stream
-            $responseJson = json_encode([
+            $responsePayloadData = [
                 'status'  => $status,
                 'headers' => (object)$respHeaders,
                 'body'    => $body,
                 'memory'  => $currentMemory,
                 'peak'    => $peakMemory,
-            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            ];
+            if (!empty($respCookies)) {
+                $responsePayloadData['cookies'] = $respCookies;
+            }
 
-            unset($body, $respHeaders);
+            $responseJson = json_encode(
+                $responsePayloadData,
+                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE
+            );
+            unset($responsePayloadData, $body, $respHeaders, $respCookies);
 
             if ($responseJson === false) {
                 bakpia_log("[PHP Worker] Failed to encode response: " . json_last_error_msg());

@@ -136,8 +136,8 @@ pub async fn serve_static_file(docroot: &str, uri: &str, cache_max_age: u64) -> 
 }
 
 
-// Check if PHP file exists (with directory traversal sanitization)
-pub async fn find_php_file(docroot: &str, uri: &str) -> Option<String> {
+// Check if PHP file exists (with directory traversal sanitization & Front Controller fallback)
+pub async fn find_php_file(docroot: &str, uri: &str, front_controller: bool) -> Option<String> {
     let clean_uri = uri.trim_start_matches('/');
     if clean_uri.contains("..") {
         return None;
@@ -150,9 +150,11 @@ pub async fn find_php_file(docroot: &str, uri: &str) -> Option<String> {
     }
     
     // Case 2: Try adding .php extension (e.g., /users → /users.php)
-    let php_path = path.with_extension("php");
-    if php_path.exists() && php_path.is_file() {
-        return Some(php_path.to_string_lossy().to_string());
+    if !clean_uri.is_empty() && !clean_uri.ends_with(".php") {
+        let php_path = path.with_extension("php");
+        if php_path.exists() && php_path.is_file() {
+            return Some(php_path.to_string_lossy().to_string());
+        }
     }
     
     // Case 3: Try as directory with index.php (e.g., /admin → /admin/index.php)
@@ -161,13 +163,25 @@ pub async fn find_php_file(docroot: &str, uri: &str) -> Option<String> {
         return Some(index_path.to_string_lossy().to_string());
     }
     
-    // Case 4: Try directory.php/index.php (e.g., /admin/dashboard → /admin/dashboard.php)
-    if let Some(parent) = path.parent() {
-        if let Some(file_name) = path.file_name() {
-            let dir_file_path = parent.join(file_name).with_extension("php");
-            if dir_file_path.exists() && dir_file_path.is_file() {
-                return Some(dir_file_path.to_string_lossy().to_string());
+    // Case 4: Try directory.php (e.g., /admin/dashboard → /admin/dashboard.php)
+    if !clean_uri.ends_with(".php") {
+        if let Some(parent) = path.parent() {
+            if let Some(file_name) = path.file_name() {
+                let dir_file_path = parent.join(file_name).with_extension("php");
+                if dir_file_path.exists() && dir_file_path.is_file() {
+                    return Some(dir_file_path.to_string_lossy().to_string());
+                }
             }
+        }
+    }
+
+    // Case 5: Modern MVC Front Controller fallback (`try_files $uri $uri/ /index.php`)
+    // Routes clean URLs (e.g. `/api/v1/users/42` in Laravel, Symfony, Slim, CI4) to `{docroot}/index.php`
+    // while keeping explicit missing `.php` files as 404.
+    if front_controller && !clean_uri.ends_with(".php") {
+        let root_index = Path::new(docroot).join("index.php");
+        if root_index.exists() && root_index.is_file() {
+            return Some(root_index.to_string_lossy().to_string());
         }
     }
     

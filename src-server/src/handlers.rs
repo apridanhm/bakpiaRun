@@ -98,7 +98,7 @@ pub async fn php_handler(
         return static_file::serve_static_file(&config.php.docroot, path, config.server.static_cache_max_age).await;
     }
     
-    let file_path = match static_file::find_php_file(&config.php.docroot, path).await {
+    let file_path = match static_file::find_php_file(&config.php.docroot, path, config.php.front_controller).await {
         Some(fp) => fp,
         None => {
             if is_debug {
@@ -415,6 +415,10 @@ pub async fn php_handler(
                 if !hdr_k.eq_ignore_ascii_case("content-type") {
                     response = response.header(hdr_k.as_str(), hdr_v.as_str());
                 }
+            }
+
+            for cookie_hdr in &php_response.cookies {
+                response = response.header(axum::http::header::SET_COOKIE, cookie_hdr.as_str());
             }
 
             response = apply_security_headers(response, &config.security);

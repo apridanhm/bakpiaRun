@@ -26,6 +26,7 @@ php:
   default_content_type: "text/html; charset=utf-8"
   disable_functions: "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
   open_basedir_docroot: true
+  front_controller: true
 
 socket:
   directory: "/tmp/bakpiarun"

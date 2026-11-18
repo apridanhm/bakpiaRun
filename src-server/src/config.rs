@@ -216,6 +216,10 @@ pub struct PhpConfig {
     pub disable_functions: String,
     #[serde(default = "default_true")]
     pub open_basedir_docroot: bool,
+    #[serde(default)]
+    pub open_basedir_extra_paths: Vec<String>,
+    #[serde(default = "default_true")]
+    pub front_controller: bool,
 }
 
 fn default_php_binary() -> String {
@@ -383,6 +387,11 @@ impl Config {
         }
         if let Ok(log_level) = env::var("BAKPIARUN_LOG_LEVEL") {
             self.logging.level = log_level;
+        }
+        if let Ok(fc) = env::var("BAKPIARUN_FRONT_CONTROLLER") {
+            if let Ok(enabled) = fc.parse::<bool>() {
+                self.php.front_controller = enabled;
+            }
         }
     }
 

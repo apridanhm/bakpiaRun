@@ -86,20 +86,55 @@ impl Worker {
                 .parent()
                 .and_then(|p| p.to_str())
                 .unwrap_or(&config.php.docroot);
-            let lib_dir = std::path::Path::new(&config.php.docroot)
-                .parent()
-                .map(|p| p.join("lib"))
-                .filter(|p| p.exists())
-                .and_then(|p| p.to_str().map(|s| format!(":{}", s)))
-                .unwrap_or_default();
-            let open_basedir = format!(
-                "{}:{}:{}:{}{}:/tmp",
-                config.php.docroot,
-                worker_dir,
-                config.socket.directory,
-                config.php.upload_tmp_dir,
-                lib_dir
-            );
+
+            let mut allowed_paths = vec![
+                config.php.docroot.clone(),
+                worker_dir.to_string(),
+                config.socket.directory.clone(),
+                config.php.upload_tmp_dir.clone(),
+                "/tmp".to_string(),
+            ];
+
+            // Always allow BakpiaRun's own `lib/` directory (sibling of `src-worker/`) for BakpiaLaravelBridge & BakpiaQueue
+            if let Some(bakpia_root) = std::path::Path::new(worker_dir).parent() {
+                let bakpia_lib = bakpia_root.join("lib");
+                if bakpia_lib.exists() {
+                    if let Some(s) = bakpia_lib.to_str() {
+                        allowed_paths.push(s.to_string());
+                    }
+                }
+            }
+
+            if let Some(parent) = std::path::Path::new(&config.php.docroot).parent() {
+                let lib_path = parent.join("lib");
+                if lib_path.exists() {
+                    if let Some(s) = lib_path.to_str() {
+                        allowed_paths.push(s.to_string());
+                    }
+                }
+
+                // Auto-detect modern PHP framework root (Laravel, Symfony, CI4, Composer)
+                let is_framework_root = parent.join("vendor").exists()
+                    || parent.join("composer.json").exists()
+                    || parent.join("artisan").exists()
+                    || parent.join("spark").exists();
+                let parent_str = parent.to_str().unwrap_or("");
+                let unsafe_system_root = matches!(
+                    parent_str,
+                    "" | "/" | "/etc" | "/var" | "/usr" | "/root" | "/home"
+                );
+                if is_framework_root && !unsafe_system_root {
+                    allowed_paths.push(parent_str.to_string());
+                }
+            }
+
+            for extra in &config.php.open_basedir_extra_paths {
+                if !extra.trim().is_empty() {
+                    allowed_paths.push(extra.trim().to_string());
+                }
+            }
+
+            let open_basedir = allowed_paths.join(":");
             cmd.arg("-d").arg(format!("open_basedir={}", open_basedir));
         }
 

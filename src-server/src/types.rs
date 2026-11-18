@@ -43,6 +43,8 @@ pub struct PhpResponse {
     pub peak: u64,
     #[serde(default, deserialize_with = "deserialize_headers_map_or_seq")]
     pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub cookies: Vec<String>,
 }
 
 fn deserialize_headers_map_or_seq<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>

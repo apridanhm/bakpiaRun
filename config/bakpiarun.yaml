@@ -27,6 +27,7 @@ php:
   # Anti-PHP2Shell (CVE-2026-109618 / CVE-2026-109619) Hardening
   disable_functions: "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
   open_basedir_docroot: true
+  front_controller: true  # Fallback clean URL (Laravel/Symfony/CI4/REST) ke /index.php
 
 socket:
   directory: "/tmp/bakpiarun"

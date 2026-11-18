@@ -28,7 +28,7 @@ use logger::Logger;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::Router;
 use rate_limiter::RateLimiter;
 use tower_http::compression::{CompressionLayer, predicate::SizeAbove};
@@ -189,10 +189,10 @@ async fn main() {
     //    .route("/metrics", get(metrics_handler))
     //    .route("/reload", get(reload_handler));
 
-    // Build Router
+    // Build Router (mendukung seluruh HTTP method REST: GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD)
     let mut app = Router::new()
-        .route("/", get(php_handler).post(php_handler))
-        .route("/*path", get(php_handler).post(php_handler));
+        .route("/", any(php_handler))
+        .route("/*path", any(php_handler));
 
     // Add admin routes with authentication
     if config.queue.enabled {
