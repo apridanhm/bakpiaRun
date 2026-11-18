@@ -1,0 +1,112 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  https_port: 8443
+  admin_token: "dev-token-for-local-testing"
+  max_body_size_mb: 50
+  static_cache_max_age: 31536000
+  tls:
+    enabled: false
+    cert_path: "/app/certs/cert.pem"
+    key_path: "/app/certs/key.pem"
+
+php:
+  binary_path: "php"
+  docroot: "/app/public"
+  worker_path: "/app/src-worker/worker.php"
+  worker_count: 32
+  memory_limit_mb: 128
+  max_requests: 5000
+  timeout_ms: 30000
+  connection_pool_size: 5
+  upload_tmp_dir: "/tmp/bakpiarun_uploads"
+  max_payload_mb: 100
+  worker_startup_delay_ms: 500
+  rolling_restart_delay_ms: 200
+  default_content_type: "text/html; charset=utf-8"
+  # Anti-PHP2Shell (CVE-2026-109618 / CVE-2026-109619) Hardening
+  disable_functions: "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
+  open_basedir_docroot: true
+
+socket:
+  directory: "/tmp/bakpiarun"
+
+logging:
+  access_log_enabled: true
+  access_log: "/dev/stdout"
+  error_log_enabled: true
+  error_log: "/dev/stderr"
+  level: "info"  # debug, info, warn, error
+
+rate_limit:
+  enabled: false
+  requests_per_minute: 120
+  burst_size: 20
+
+security:
+  x_frame_options: "DENY"
+  x_content_type_options: true
+  x_xss_protection: true
+  referrer_policy: "strict-origin-when-cross-origin"
+
+compression:
+  enabled: true
+  min_size_bytes: 1024
+  level: 6
+
+# Proactive Anti-OOM Engine (/proc/[pid]/status + cgroups v2 + Graceful Worker Recycling)
+anti_oom:
+  enabled: true
+  check_interval_ms: 1000
+  worker_threshold_percent: 80
+  cgroup_threshold_percent: 85
+  cgroup_memory_current_path: "/sys/fs/cgroup/memory.current"
+  cgroup_memory_max_path: "/sys/fs/cgroup/memory.max"
+
+pools:
+  # HEAVY POOL (prioritas spesifik)
+  - name: "heavy"
+    worker_count: 8
+    memory_limit_mb: 512
+    max_requests: 100
+    timeout_ms: 300000
+    headers:
+      X-Workload: "heavy"
+      X-Pool: "heavy"
+    patterns:
+      - "/heavy-db.php"
+      - "/heavy-*"
+      - "/api/export/*"
+      - "/api/report/*"
+
+  # FAST POOL (default catch-all)
+  - name: "fast"
+    worker_count: 32
+    memory_limit_mb: 128
+    max_requests: 5000
+    timeout_ms: 30000
+    headers:
+      X-Workload: "light"
+      X-Pool: "fast"
+    patterns:
+      - "/*"
+
+queue:
+  enabled: true
+  max_jobs: 10000
+  poll_interval_ms: 500
+
+db_proxy:
+  enabled: false
+  listen_address: "127.0.0.1"
+  listen_port: 3307
+  spoof_version: "8.0.33-bakpiarun-proxy"
+  target:
+    host: "127.0.0.1"
+    port: 3306
+    username: "bakpiarun_user"
+    password: "change_me"
+    database: "bakpiarun_db"
+  pool:
+    min_connections: 2
+    max_connections: 20

@@ -83,13 +83,16 @@ pub async fn php_handler(
         None
     };
 
-    // LOCK CONFIG
+    // LOCK CONFIG (1x per request)
     let config = state.config.lock().await.clone();
+    let is_debug = config.logging.is_debug();
     let path = uri.path();
 
     // STATIC FILE CHECK
     if static_file::is_static_file(path) {
-        println!("[Static] Serving: {}", path);
+        if is_debug {
+            println!("[Static] Serving: {}", path);
+        }
         state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 200, 0);
         return static_file::serve_static_file(&config.php.docroot, path, config.server.static_cache_max_age).await;
     }
@@ -97,7 +100,9 @@ pub async fn php_handler(
     let file_path = match static_file::find_php_file(&config.php.docroot, path).await {
         Some(fp) => fp,
         None => {
-            println!("[404] Not found: {}", path);
+            if is_debug {
+                println!("[404] Not found: {}", path);
+            }
             let duration_ms = start_time.elapsed().as_millis() as u64;
             state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 404, duration_ms);
             return Response::builder()
@@ -107,11 +112,22 @@ pub async fn php_handler(
         }
     };
 
-    // 🎯 WORKLOAD-AWARE ROUTER: Pilih pool berdasarkan atribut HTTP Header & URL pattern
-    let pool_name = {
+    // 🎯 WORKLOAD-AWARE ROUTER: Pilih pool berdasarkan atribut HTTP Header & URL pattern (1x lock PoolManager)
+    let (pool_name, pool_arc) = {
         let pm = state.pool_manager.lock().await;
         match pm.get_pool_name_for_request(path, &headers) {
-            Some(name) => name,
+            Some(name) => match pm.get_pool(&name) {
+                Some(arc) => (name, arc.clone()),
+                None => {
+                    let duration_ms = start_time.elapsed().as_millis() as u64;
+                    state.logger.log_error("ERROR", &format!("Pool '{}' missing for path: {}", name, path));
+                    state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Html("<h1>500 Error</h1><p>Selected worker pool unavailable</p>"),
+                    ).into_response();
+                }
+            },
             None => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 state.logger.log_error("ERROR", &format!("No suitable pool for path: {} (URI: {})", path, uri));
@@ -123,30 +139,8 @@ pub async fn php_handler(
             }
         }
     };
-    println!("[Router] {} → Pool: {}", path, pool_name);
-
-    // Ambil worker dari pool yang dipilih beserta pool_config (isolasi lock per-worker)
-    let (worker_index, worker_arc, pool_config) = {
-        let pm = state.pool_manager.lock().await;
-        let pool_arc = pm.get_pool(&pool_name).unwrap().clone();
-        drop(pm);
-        let pool = pool_arc.lock().await;
-        let (idx, w_arc) = pool.get_next_worker();
-        (idx, w_arc, pool.config.clone())
-    };
-
-    // Ensure worker running (hanya lock worker spesifik ini, tidak mengunci seluruh pool!)
-    {
-        let mut worker = worker_arc.lock().await;
-        if let Err(e) = worker.ensure_running(&pool_config).await {
-            let duration_ms = start_time.elapsed().as_millis() as u64;
-            state.logger.log_error("ERROR", &format!("Worker #{} in pool '{}' failed to start: {} (URI: {})", worker_index, pool_name, e, uri));
-            state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(format!("<h1>500 Error</h1><p>Failed to start worker: {}</p>", e)),
-            ).into_response();
-        }
+    if is_debug {
+        println!("[Router] {} → Pool: {}", path, pool_name);
     }
 
     // Parse headers, cookies, body (BIARKAN SAMA)
@@ -301,19 +295,45 @@ pub async fn php_handler(
         files,
     };
 
-    // AMBIL socket_path, conn_pool, pool_size DARI WORKER YANG DIPILIH & tandai active_requests += 1
-    let (socket_path, conn_pool, pool_size) = {
-        let mut w = worker_arc.lock().await;
-        w.active_requests += 1;
-        (w.socket_path.clone(), w.connection_pool.clone(), w.pool_size)
+    // Pilih worker optimal (Idle-First / Least-Loaded) tepat sebelum eksekusi IPC
+    let (worker_index, worker_arc, in_flight_guard, pool_config) = {
+        let pool = pool_arc.lock().await;
+        let (idx, w_arc, guard) = pool.get_next_worker();
+        (idx, w_arc, guard, pool.config.clone())
+    };
+
+    // Pastikan worker hidup & ambil handle persistent keep-alive UDS stream dalam 1x lock
+    let (socket_path, ipc_stream) = {
+        let mut worker = worker_arc.lock().await;
+        if let Err(e) = worker.ensure_running(&pool_config).await {
+            drop(in_flight_guard);
+            for tmp_file in &uploaded_temp_files {
+                let _ = std::fs::remove_file(tmp_file);
+            }
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            state.logger.log_error(
+                "ERROR",
+                &format!("Worker #{} in pool '{}' failed to start: {} (URI: {})", worker_index, pool_name, e, uri),
+            );
+            state.logger.log_access(&client_ip, &method.to_string(), &uri.to_string(), 500, duration_ms);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(format!("<h1>500 Error</h1><p>Failed to start worker: {}</p>", e)),
+            ).into_response();
+        }
+        (worker.socket_path.clone(), worker.ipc_stream.clone())
     };
 
     // WRAP DENGAN TIMEOUT (gunakan timeout dari pool yang dipilih)
     let timeout_duration = std::time::Duration::from_millis(pool_config.php.timeout_ms);
     let result = tokio::time::timeout(
-        timeout_duration, 
-        send_to_php_worker(&socket_path, &conn_pool, pool_size, request)
-    ).await;
+        timeout_duration,
+        send_to_php_worker(&socket_path, &ipc_stream, request),
+    )
+    .await;
+
+    // Lepaskan in_flight_guard segera setelah eksekusi PHP selesai agar worker langsung tersedia
+    drop(in_flight_guard);
 
     // Cleanup temporary uploaded files after PHP worker finishes processing
     for tmp_file in &uploaded_temp_files {
@@ -339,27 +359,37 @@ pub async fn php_handler(
             // UPDATE stats worker (/proc/[pid]/status VmRSS + PHP memory) tanpa mengunci seluruh pool
             let restart_reason = {
                 let mut worker = worker_arc.lock().await;
-                worker.active_requests = worker.active_requests.saturating_sub(1);
                 worker.update_stats(php_response.memory, php_response.peak);
-                println!(
-                    "[Pool:{}] Worker #{} (PID: {:?}) Request #{} handled. PHP Mem: {} MB, Peak: {} MB, /proc VmRSS: {} MB",
-                    pool_name,
-                    worker_index,
-                    worker.pid,
-                    worker.requests_handled,
-                    php_response.memory / 1024 / 1024,
-                    php_response.peak / 1024 / 1024,
-                    worker.rss_bytes / 1024 / 1024
-                );
+                if is_debug {
+                    println!(
+                        "[Pool:{}] Worker #{} (PID: {:?}) Request #{} handled. PHP Mem: {} MB, Peak: {} MB, /proc VmRSS: {} MB",
+                        pool_name,
+                        worker_index,
+                        worker.pid,
+                        worker.requests_handled,
+                        php_response.memory / 1024 / 1024,
+                        php_response.peak / 1024 / 1024,
+                        worker.rss_bytes / 1024 / 1024
+                    );
+                }
                 worker.should_restart(&pool_config)
             };
 
+            // Jalankan graceful worker recycling secara asinkron di background agar response HTTP tidak tertahan (0ms P99 impact)
             if let Some(reason) = restart_reason {
                 println!("[Anti-OOM] {}", reason);
-                let mut worker = worker_arc.lock().await;
-                if let Err(e) = worker.graceful_recycle(&pool_config).await {
-                    eprintln!("[Anti-OOM] Failed to recycle worker #{} in pool '{}': {}", worker_index, pool_name, e);
-                }
+                let worker_for_recycle = worker_arc.clone();
+                let cfg_for_recycle = pool_config.clone();
+                let pool_for_log = pool_name.clone();
+                tokio::spawn(async move {
+                    let mut worker = worker_for_recycle.lock().await;
+                    if let Err(e) = worker.graceful_recycle(&cfg_for_recycle).await {
+                        eprintln!(
+                            "[Anti-OOM] Failed to recycle worker #{} in pool '{}': {}",
+                            worker_index, pool_for_log, e
+                        );
+                    }
+                });
             }
 
             let content_type_hdr = php_response
@@ -380,9 +410,7 @@ pub async fn php_handler(
                 }
             }
 
-            let config = state.config.lock().await;
             response = apply_security_headers(response, &config.security);
-            drop(config);
             
             if let Some(headers) = rate_limit_headers {
                 response = response
@@ -411,7 +439,6 @@ pub async fn php_handler(
             eprintln!("[Pool:{}] Worker #{} Error: {}", pool_name, worker_index, e);
             {
                 let mut worker = worker_arc.lock().await;
-                worker.active_requests = worker.active_requests.saturating_sub(1);
                 let _ = worker.ensure_running(&pool_config).await;
             }
             (
@@ -432,12 +459,17 @@ pub async fn php_handler(
                 metrics.record_error();
             }
             
-            {
-                let mut worker = worker_arc.lock().await;
-                worker.active_requests = worker.active_requests.saturating_sub(1);
-                println!("[Timeout] Gracefully recycling timed-out worker #{} in pool '{}'...", worker_index, pool_name);
-                let _ = worker.graceful_recycle(&pool_config).await;
-            }
+            let worker_for_recycle = worker_arc.clone();
+            let cfg_for_recycle = pool_config.clone();
+            let pool_for_log = pool_name.clone();
+            tokio::spawn(async move {
+                let mut worker = worker_for_recycle.lock().await;
+                println!(
+                    "[Timeout] Gracefully recycling timed-out worker #{} in pool '{}'...",
+                    worker_index, pool_for_log
+                );
+                let _ = worker.graceful_recycle(&cfg_for_recycle).await;
+            });
             
             (
                 StatusCode::GATEWAY_TIMEOUT,
@@ -485,8 +517,8 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
                 "index": worker.index,
                 "pid": worker.pid,
                 "alive": is_alive,
-                "draining": worker.draining,
-                "active_requests": worker.active_requests,
+                "draining": worker.is_draining(),
+                "active_requests": worker.active_requests(),
                 "requests": worker.requests_handled,
                 "recycle_count": worker.recycle_count,
                 "memory_mb": worker.last_memory / 1024 / 1024,

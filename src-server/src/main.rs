@@ -61,10 +61,10 @@ async fn main() {
 
     config.apply_env_overrides();
 
-    /*if let Err(e) = config.validate() {
+    if let Err(e) = config.validate() {
         eprintln!("Invalid config: {}", e);
         std::process::exit(1);
-    }*/
+    }
         // Set admin token from config to environment variable (if not already set)
     if std::env::var("BAKPIA_ADMIN_TOKEN").is_err() {
         if let Some(ref token) = config.server.admin_token {
@@ -245,6 +245,7 @@ async fn main() {
 
     // Logging config
     println!("Logging Configuration:");
+    println!("  - Level:      {}", config.logging.level);
     println!("  - Access Log: {}", if config.logging.access_log_enabled { 
         format!("Enabled ({})", config.logging.access_log) 
     } else { 

@@ -1,10 +1,11 @@
-use tokio::process::{Child, Command};
-use tokio::time::{sleep, Duration};
-use crate::config::Config;
 use crate::anti_oom::read_process_proc_status;
+use crate::config::Config;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 
 pub struct Worker {
     pub index: usize,
@@ -18,18 +19,18 @@ pub struct Worker {
     pub rss_bytes: u64,
     /// High Water Mark (VmHWM) read from `/proc/[pid]/status` in bytes
     pub hwm_bytes: u64,
-    /// Number of currently active in-flight requests on this worker
-    pub active_requests: usize,
-    /// True when the worker is being drained for graceful recycling (no new requests assigned)
-    pub draining: bool,
+    /// Lock-free real-time count of active/queued requests assigned to this worker
+    pub in_flight: Arc<AtomicUsize>,
+    /// Lock-free flag indicating the worker is draining for graceful recycling
+    pub draining: Arc<AtomicBool>,
     /// Total number of times this worker has been proactively recycled by the Anti-OOM Engine
     pub recycle_count: u64,
-    pub connection_pool: Arc<Mutex<Vec<UnixStream>>>,
-    pub pool_size: usize,
+    /// Dedicated persistent keep-alive Unix Domain Socket stream to this PHP worker
+    pub ipc_stream: Arc<Mutex<Option<UnixStream>>>,
 }
 
 impl Worker {
-    pub fn new(index: usize, socket_path: String, pool_size: usize) -> Self {
+    pub fn new(index: usize, socket_path: String) -> Self {
         Self {
             index,
             process: None,
@@ -40,17 +41,29 @@ impl Worker {
             last_peak: 0,
             rss_bytes: 0,
             hwm_bytes: 0,
-            active_requests: 0,
-            draining: false,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            draining: Arc::new(AtomicBool::new(false)),
             recycle_count: 0,
-            connection_pool: Arc::new(Mutex::new(Vec::with_capacity(pool_size))),
-            pool_size,
+            ipc_stream: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn active_requests(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
     }
 
     pub async fn start(&mut self, config: &Config) -> Result<(), String> {
         println!("[Supervisor] Starting PHP worker #{}...", self.index);
 
+        // Drop any stale keep-alive UDS stream before unlinking old socket
+        {
+            let mut stream_guard = self.ipc_stream.lock().await;
+            *stream_guard = None;
+        }
         let _ = std::fs::remove_file(&self.socket_path);
 
         let timeout_sec = (config.php.timeout_ms as f64 / 1000.0).max(1.0);
@@ -73,12 +86,19 @@ impl Worker {
                 .parent()
                 .and_then(|p| p.to_str())
                 .unwrap_or(&config.php.docroot);
+            let lib_dir = std::path::Path::new(&config.php.docroot)
+                .parent()
+                .map(|p| p.join("lib"))
+                .filter(|p| p.exists())
+                .and_then(|p| p.to_str().map(|s| format!(":{}", s)))
+                .unwrap_or_default();
             let open_basedir = format!(
-                "{}:{}:{}:{}:/tmp",
+                "{}:{}:{}:{}{}:/tmp",
                 config.php.docroot,
                 worker_dir,
                 config.socket.directory,
-                config.php.upload_tmp_dir
+                config.php.upload_tmp_dir,
+                lib_dir
             );
             cmd.arg("-d").arg(format!("open_basedir={}", open_basedir));
         }
@@ -90,7 +110,8 @@ impl Worker {
             .env("BAKPIARUN_MAX_PAYLOAD_MB", config.php.max_payload_mb.to_string())
             .env("BAKPIARUN_SERVER_HOST", &config.server.host)
             .env("BAKPIARUN_SERVER_PORT", config.server.port.to_string())
-            .env("BAKPIARUN_BASE_URL", &base_url);
+            .env("BAKPIARUN_BASE_URL", &base_url)
+            .env("BAKPIARUN_LOG_LEVEL", &config.logging.level);
 
         if let Some(ref token) = config.server.admin_token {
             cmd.env("BAKPIARUN_ADMIN_TOKEN", token);
@@ -105,13 +126,11 @@ impl Worker {
         self.requests_handled = 0;
         self.last_memory = 0;
         self.last_peak = 0;
-        self.draining = false;
+        self.draining.store(false, Ordering::Release);
 
         println!(
             "[Supervisor] PHP worker #{} started (PID: {:?}, Socket: {})",
-            self.index,
-            self.pid,
-            self.socket_path
+            self.index, self.pid, self.socket_path
         );
 
         // Wait until socket is ready or up to worker_startup_delay_ms
@@ -121,14 +140,8 @@ impl Worker {
             if std::path::Path::new(&self.socket_path).exists() {
                 break;
             }
-            sleep(Duration::from_millis(10)).await;
-            waited_ms += 10;
-        }
-
-        // Clear stale UDS connections from previous worker process
-        {
-            let mut pool = self.connection_pool.lock().await;
-            pool.clear();
+            sleep(Duration::from_millis(5)).await;
+            waited_ms += 5;
         }
 
         self.refresh_proc_memory();
@@ -136,8 +149,17 @@ impl Worker {
     }
 
     pub async fn stop(&mut self) {
+        // Close keep-alive UDS stream first so PHP worker breaks out of stream_select cleanly
+        {
+            let mut stream_guard = self.ipc_stream.lock().await;
+            *stream_guard = None;
+        }
+
         if let Some(mut child) = self.process.take() {
-            println!("[Supervisor] Stopping PHP worker #{} (PID: {:?})...", self.index, self.pid);
+            println!(
+                "[Supervisor] Stopping PHP worker #{} (PID: {:?})...",
+                self.index, self.pid
+            );
 
             if let Err(e) = child.kill().await {
                 eprintln!("[Supervisor] Error killing worker #{}: {}", self.index, e);
@@ -147,8 +169,6 @@ impl Worker {
             self.pid = None;
             self.rss_bytes = 0;
             self.hwm_bytes = 0;
-            let mut pool = self.connection_pool.lock().await;
-            pool.clear();
             println!("[Supervisor] PHP worker #{} stopped", self.index);
         }
     }
@@ -164,30 +184,30 @@ impl Worker {
     }
 
     /// Graceful Worker Recycling:
-    /// 1. Marks worker as `draining = true` so the router stops assigning new requests to it.
-    /// 2. Waits for any active in-flight request to finish.
+    /// 1. Atomically marks worker as `draining = true` so the router stops assigning new requests.
+    /// 2. Waits for any active in-flight requests (`in_flight` atomic counter) to finish.
     /// 3. Terminates the old PHP worker process and immediately spawns a fresh replacement.
     pub async fn graceful_recycle(&mut self, config: &Config) -> Result<(), String> {
-        if self.draining {
+        if self.draining.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        self.draining = true;
         println!(
             "[Anti-OOM] Gracefully recycling worker #{} (PID: {:?}, active_requests: {})...",
-            self.index, self.pid, self.active_requests
+            self.index,
+            self.pid,
+            self.active_requests()
         );
 
-        // Wait up to 2 seconds if an active request is finishing
         let mut waited_ms = 0u64;
-        while self.active_requests > 0 && waited_ms < 2000 {
-            sleep(Duration::from_millis(20)).await;
-            waited_ms += 20;
+        while self.active_requests() > 0 && waited_ms < 2000 {
+            sleep(Duration::from_millis(10)).await;
+            waited_ms += 10;
         }
 
         self.stop().await;
         self.recycle_count += 1;
         let res = self.start(config).await;
-        self.draining = false;
+        self.draining.store(false, Ordering::Release);
         res
     }
 

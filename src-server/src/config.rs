@@ -199,6 +199,8 @@ pub struct PhpConfig {
     pub memory_limit_mb: u64,
     pub max_requests: u64,
     pub timeout_ms: u64,
+    #[allow(dead_code)]
+    #[serde(default = "default_connection_pool_size")]
     pub connection_pool_size: usize,
     #[serde(default = "default_upload_tmp_dir")]
     pub upload_tmp_dir: String,
@@ -218,6 +220,10 @@ pub struct PhpConfig {
 
 fn default_php_binary() -> String {
     "php".to_string()
+}
+
+fn default_connection_pool_size() -> usize {
+    1
 }
 
 fn default_upload_tmp_dir() -> String {
@@ -255,6 +261,18 @@ pub struct LoggingConfig {
     pub access_log: String,
     pub error_log_enabled: bool,
     pub error_log: String,
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+impl LoggingConfig {
+    pub fn is_debug(&self) -> bool {
+        self.level.eq_ignore_ascii_case("debug")
+    }
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -293,6 +311,14 @@ impl Config {
             self.php.docroot = docroot;
         }
 
+        if let Ok(worker_path) = env::var("BAKPIARUN_WORKER_PATH") {
+            self.php.worker_path = worker_path;
+        }
+
+        if let Ok(socket_dir) = env::var("BAKPIARUN_SOCKET_DIR") {
+            self.socket.directory = socket_dir;
+        }
+
         if let Ok(binary_path) = env::var("BAKPIARUN_PHP_BINARY") {
             self.php.binary_path = binary_path;
         }
@@ -307,6 +333,56 @@ impl Config {
             if let Ok(limit) = memory_limit.parse::<u64>() {
                 self.php.memory_limit_mb = limit;
             }
+        }
+
+        if let Ok(tls_enabled) = env::var("BAKPIARUN_TLS_ENABLED") {
+            if let Ok(enabled) = tls_enabled.parse::<bool>() {
+                self.server.tls.enabled = enabled;
+            }
+        }
+
+        if let Ok(queue_enabled) = env::var("BAKPIARUN_QUEUE_ENABLED") {
+            if let Ok(enabled) = queue_enabled.parse::<bool>() {
+                self.queue.enabled = enabled;
+            }
+        }
+
+        if let Ok(db_proxy_enabled) = env::var("BAKPIARUN_DB_PROXY_ENABLED") {
+            if let Ok(enabled) = db_proxy_enabled.parse::<bool>() {
+                self.db_proxy.enabled = enabled;
+            }
+        }
+
+        if let Ok(db_host) = env::var("BAKPIARUN_DB_HOST") {
+            self.db_proxy.target.host = db_host;
+        }
+        if let Ok(db_port) = env::var("BAKPIARUN_DB_PORT") {
+            if let Ok(p) = db_port.parse::<u16>() {
+                self.db_proxy.target.port = p;
+            }
+        }
+        if let Ok(db_user) = env::var("BAKPIARUN_DB_USER") {
+            self.db_proxy.target.username = db_user;
+        }
+        if let Ok(db_pass) = env::var("BAKPIARUN_DB_PASSWORD") {
+            self.db_proxy.target.password = db_pass;
+        }
+        if let Ok(db_name) = env::var("BAKPIARUN_DB_NAME") {
+            self.db_proxy.target.database = db_name;
+        }
+
+        if let Ok(worker_thresh) = env::var("BAKPIARUN_ANTI_OOM_WORKER_THRESHOLD") {
+            if let Ok(pct) = worker_thresh.parse::<u64>() {
+                self.anti_oom.worker_threshold_percent = pct;
+            }
+        }
+        if let Ok(cgroup_thresh) = env::var("BAKPIARUN_ANTI_OOM_CGROUP_THRESHOLD") {
+            if let Ok(pct) = cgroup_thresh.parse::<u64>() {
+                self.anti_oom.cgroup_threshold_percent = pct;
+            }
+        }
+        if let Ok(log_level) = env::var("BAKPIARUN_LOG_LEVEL") {
+            self.logging.level = log_level;
         }
     }
 
@@ -333,13 +409,48 @@ impl Config {
             return Err("Max requests must be at least 1".to_string());
         }
 
-        // validasi timeout
-        if self.php.timeout_ms == 0 {
-            return Err("Timeout cannot be 0. Set at least 1000ms (1 second)".to_string());
-        }
-        
         if self.php.timeout_ms < 1000 {
-            return Err("Timeout too small. Minimum 1000ms (1 second) recommended".to_string());
+            return Err("Timeout too small. Minimum 1000ms (1 second) required".to_string());
+        }
+
+        if !std::path::Path::new(&self.php.docroot).exists() {
+            return Err(format!("PHP docroot does not exist: {}", self.php.docroot));
+        }
+
+        if !std::path::Path::new(&self.php.worker_path).exists() {
+            return Err(format!("PHP worker_path does not exist: {}", self.php.worker_path));
+        }
+
+        if self.pools.is_empty() {
+            return Err("At least one worker pool must be defined in 'pools'".to_string());
+        }
+
+        for pool in &self.pools {
+            if pool.name.trim().is_empty() {
+                return Err("Pool name cannot be empty".to_string());
+            }
+            if pool.worker_count == 0 {
+                return Err(format!("Pool '{}': worker_count must be at least 1", pool.name));
+            }
+            if pool.memory_limit_mb == Some(0) {
+                return Err(format!("Pool '{}': memory_limit_mb must be at least 1 MB", pool.name));
+            }
+            if pool.max_requests == Some(0) {
+                return Err(format!("Pool '{}': max_requests must be at least 1", pool.name));
+            }
+            if let Some(t) = pool.timeout_ms {
+                if t < 1000 {
+                    return Err(format!("Pool '{}': timeout_ms must be at least 1000ms", pool.name));
+                }
+            }
+        }
+
+        if self.anti_oom.worker_threshold_percent == 0 || self.anti_oom.worker_threshold_percent > 100 {
+            return Err("anti_oom.worker_threshold_percent must be between 1 and 100".to_string());
+        }
+
+        if self.anti_oom.cgroup_threshold_percent == 0 || self.anti_oom.cgroup_threshold_percent > 100 {
+            return Err("anti_oom.cgroup_threshold_percent must be between 1 and 100".to_string());
         }
         
         Ok(())
