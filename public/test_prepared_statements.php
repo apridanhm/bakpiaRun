@@ -6,8 +6,8 @@ try {
         '',
         [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            // PAKSA pake REAL prepared statements (bukan emulated)
-            PDO::ATTR_EMULATE_PREPARES => true,
+            // PAKSA pake REAL binary prepared statements (COM_STMT_PREPARE 0x16, bukan emulated!)
+            PDO::ATTR_EMULATE_PREPARES => false,
         ]
     );
     

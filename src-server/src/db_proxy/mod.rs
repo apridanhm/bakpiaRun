@@ -1,25 +1,133 @@
-use mysql_async::prelude::*;
-use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
-use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+pub mod mysql_protocol;
+
 use crate::config::Config;
+use mysql_async::prelude::*;
+use mysql_async::{Conn, Opts, OptsBuilder, Params, Pool, PoolConstraints, PoolOpts};
+use mysql_protocol::*;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+static NEXT_CLIENT_CONN_ID: AtomicU32 = AtomicU32::new(1);
 
 pub struct DbProxy;
 
-struct ConnectionState {
-    statements: HashMap<u32, String>,
-    next_stmt_id: u32,
+struct StoredStatement {
+    query: String,
+    num_params: usize,
+    /// Cached `(field_type, is_unsigned)` descriptors from the initial `COM_STMT_EXECUTE`
+    /// so subsequent executions with `new_params_bound == 0` decode accurately.
+    param_types: Vec<(u8, bool)>,
+    /// Streamed BLOB chunks sent via `COM_STMT_SEND_LONG_DATA` (`0x18`)
+    long_data: HashMap<u16, Vec<u8>>,
 }
 
-impl ConnectionState {
+struct SessionState {
+    statements: HashMap<u32, StoredStatement>,
+    next_stmt_id: u32,
+    /// Backend connection pinned to this client while a transaction or stateful session setting is active
+    pinned_conn: Option<Conn>,
+    in_explicit_tx: bool,
+    autocommit_disabled: bool,
+    session_pinned: bool,
+}
+
+impl SessionState {
     fn new() -> Self {
         Self {
             statements: HashMap::new(),
             next_stmt_id: 1,
+            pinned_conn: None,
+            in_explicit_tx: false,
+            autocommit_disabled: false,
+            session_pinned: false,
         }
+    }
+
+    fn status_flags(&self) -> u16 {
+        let mut flags = 0u16;
+        if !self.autocommit_disabled {
+            flags |= 0x0002; // SERVER_STATUS_AUTOCOMMIT
+        }
+        if self.in_explicit_tx || self.autocommit_disabled {
+            flags |= 0x0001; // SERVER_STATUS_IN_TRANS
+        }
+        flags
+    }
+
+    fn should_keep_pinned(&self) -> bool {
+        self.in_explicit_tx || self.autocommit_disabled || self.session_pinned
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxIntent {
+    Begin,
+    CommitOrRollback,
+    SetAutocommitOff,
+    SetAutocommitOn,
+    PinSession,
+    Normal,
+}
+
+fn classify_sql_intent(sql: &str) -> TxIntent {
+    let trimmed = sql.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
+    let upper = trimmed.to_ascii_uppercase();
+
+    if upper == "BEGIN"
+        || upper.starts_with("BEGIN ")
+        || upper.starts_with("BEGIN;")
+        || upper.starts_with("START TRANSACTION")
+    {
+        return TxIntent::Begin;
+    }
+
+    if upper == "COMMIT"
+        || upper.starts_with("COMMIT ")
+        || upper.starts_with("COMMIT;")
+        || upper == "ROLLBACK"
+        || upper.starts_with("ROLLBACK ")
+        || upper.starts_with("ROLLBACK;")
+    {
+        // Note: `ROLLBACK TO SAVEPOINT` stays inside the current transaction
+        if upper.contains(" TO ") {
+            return TxIntent::Normal;
+        }
+        return TxIntent::CommitOrRollback;
+    }
+
+    if upper.starts_with("SET ") {
+        let compact: String = upper.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.contains("AUTOCOMMIT=0") || compact.contains("AUTOCOMMIT=OFF") {
+            return TxIntent::SetAutocommitOff;
+        }
+        if compact.contains("AUTOCOMMIT=1") || compact.contains("AUTOCOMMIT=ON") {
+            return TxIntent::SetAutocommitOn;
+        }
+        if compact.contains("SET@") && !compact.contains("SET@@") {
+            return TxIntent::PinSession;
+        }
+    }
+
+    if upper.starts_with("LOCK TABLES") || upper.starts_with("CREATE TEMPORARY TABLE") {
+        return TxIntent::PinSession;
+    }
+
+    TxIntent::Normal
+}
+
+fn extract_mysql_error(err: &mysql_async::Error) -> (u16, [u8; 5], String) {
+    match err {
+        mysql_async::Error::Server(srv) => {
+            let mut state_bytes = *b"HY000";
+            let raw = srv.state.as_bytes();
+            if raw.len() == 5 {
+                state_bytes.copy_from_slice(raw);
+            }
+            (srv.code, state_bytes, srv.message.clone())
+        }
+        other => (1105, *b"HY000", format!("{}", other)),
     }
 }
 
@@ -30,6 +138,7 @@ impl DbProxy {
         }
 
         let db_config = &config.db_proxy;
+        let is_debug = config.logging.is_debug();
         let addr = format!("{}:{}", db_config.listen_address, db_config.listen_port);
 
         if db_config.listen_address != "127.0.0.1" && db_config.listen_address != "localhost" {
@@ -38,13 +147,13 @@ impl DbProxy {
 
         let url = format!(
             "mysql://{}:{}@{}:{}/{}",
-            db_config.target.username,
-            db_config.target.password,
+            urlencoding::encode(&db_config.target.username),
+            urlencoding::encode(&db_config.target.password),
             db_config.target.host,
             db_config.target.port,
-            db_config.target.database
+            urlencoding::encode(&db_config.target.database)
         );
-        
+
         let opts = Opts::from_url(&url)?;
         let constraints = PoolConstraints::new(
             db_config.pool.min_connections,
@@ -54,21 +163,31 @@ impl DbProxy {
         let pool_opts = PoolOpts::default().with_constraints(constraints);
         let builder = OptsBuilder::from_opts(opts).pool_opts(pool_opts);
         let pool = Pool::new(builder);
-        
+
         let mut server_version = db_config.spoof_version.clone();
-        
+
         if let Ok(mut conn) = pool.get_conn().await {
-            if let Ok(Some(real_version)) = conn.query_first::<String, _>("SELECT VERSION()").await {
+            if let Ok(Some(real_version)) = conn.query_first::<String, _>("SELECT VERSION()").await
+            {
                 server_version = format!("{}-bakpiarun-proxy", real_version);
-                println!("Dynamic Version Detection: Backend is {}", real_version);
+                println!("[DB Proxy] Dynamic Version Detection: Backend is {}", real_version);
             } else {
-                println!("Version query returned empty. Using YAML fallback: {}", server_version);
+                println!(
+                    "[DB Proxy] Version query returned empty. Using YAML fallback: {}",
+                    server_version
+                );
             }
         } else {
-            println!("Could not connect to backend for version check. Using YAML fallback: {}", server_version);
+            println!(
+                "[DB Proxy] Could not connect to backend at startup check. Using YAML fallback: {}",
+                server_version
+            );
         }
 
-        println!("Secure DB Proxy initialized on {} (Spoofing as: {})", addr, server_version);
+        println!(
+            "Secure DB Proxy initialized on {} (Spoofing as: {})",
+            addr, server_version
+        );
 
         let listener = TcpListener::bind(&addr).await?;
 
@@ -76,635 +195,672 @@ impl DbProxy {
             let (mut socket, client_addr) = listener.accept().await?;
 
             if !client_addr.ip().is_loopback() {
-                println!("[SECURITY] Blocked remote DB connection from {}", client_addr);
+                println!(
+                    "[SECURITY] Blocked non-loopback DB connection attempt from {}",
+                    client_addr
+                );
                 continue;
             }
 
+            let _ = socket.set_nodelay(true);
             let pool = pool.clone();
             let version = server_version.clone();
-            
+            let conn_id = NEXT_CLIENT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(&mut socket, pool, version).await {
-                    eprintln!("Proxy Error: {}", e);
+                if let Err(e) = Self::handle_client(&mut socket, pool, version, conn_id, is_debug).await {
+                    if is_debug {
+                        eprintln!("[DB Proxy] Client #{} error: {}", conn_id, e);
+                    }
                 }
             });
         }
     }
 
     async fn handle_client(
-        socket: &mut tokio::net::TcpStream, 
+        socket: &mut TcpStream,
         pool: Pool,
-        server_version: String
+        server_version: String,
+        conn_id: u32,
+        is_debug: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        
-        let conn_state = Arc::new(Mutex::new(ConnectionState::new()));
-        
-        let scramble = Self::generate_scramble();
-        let handshake = Self::build_handshake_v10(&scramble, &server_version);
-        
+        let mut session = SessionState::new();
+
+        // 1. Send Server HandshakeV10
+        let scramble = generate_scramble(conn_id);
+        let handshake = build_handshake_v10(conn_id, &scramble, &server_version);
         socket.write_all(&handshake).await?;
         socket.flush().await?;
 
+        // 2. Read Client HandshakeResponse41
         let mut header = [0u8; 4];
-        socket.read_exact(&mut header).await?;
-        let payload_len = (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
+        if socket.read_exact(&mut header).await.is_err() {
+            return Ok(());
+        }
+        let payload_len =
+            (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
+        let auth_seq = header[3];
         let mut auth_payload = vec![0u8; payload_len];
         socket.read_exact(&mut auth_payload).await?;
 
-        let ok_packet = Self::build_ok_packet_after_handshake(2);
+        // 3. Reply OK_Packet (Credential Masking: local worker authenticated via proxy)
+        let ok_packet = build_ok_packet(auth_seq.wrapping_add(1), 0, 0, session.status_flags());
         socket.write_all(&ok_packet).await?;
         socket.flush().await?;
-        
-        println!("PHP Client connected & authenticated (Credential Masked)");
 
+        if is_debug {
+            println!(
+                "[DB Proxy] PHP Client #{} connected & authenticated (Credential Masked)",
+                conn_id
+            );
+        }
+
+        // 4. Command Loop
         loop {
             let mut header = [0u8; 4];
-            match socket.read_exact(&mut header).await {
-                Ok(_) => {},
-                Err(_) => break,
+            if socket.read_exact(&mut header).await.is_err() {
+                break;
             }
 
-            let payload_len = (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
-            let seq_id = header[3];
+            let mut payload_len =
+                (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
+            let mut seq_id = header[3];
 
-            if payload_len == 0 { continue; }
+            if payload_len == 0 {
+                continue;
+            }
 
             let mut payload = vec![0u8; payload_len];
             socket.read_exact(&mut payload).await?;
 
+            // Support MySQL multi-packet command payloads (> 16 MB split across 0xFF_FF_FF chunks)
+            while payload_len == 0x00FF_FFFF {
+                let mut next_hdr = [0u8; 4];
+                socket.read_exact(&mut next_hdr).await?;
+                payload_len = (next_hdr[0] as usize)
+                    | ((next_hdr[1] as usize) << 8)
+                    | ((next_hdr[2] as usize) << 16);
+                seq_id = next_hdr[3];
+                if payload_len > 0 {
+                    let prev = payload.len();
+                    payload.resize(prev + payload_len, 0);
+                    socket.read_exact(&mut payload[prev..]).await?;
+                }
+            }
+
             let command = payload[0];
 
             match command {
-                0x03 => {
-                    Self::handle_com_query(socket, seq_id, &payload, &pool).await?;
-                }
-                0x09 => {
-                    Self::handle_com_stmt_prepare(socket, seq_id, &payload, &conn_state).await?;
-                }
-                0x17 => {
-                    Self::handle_com_stmt_execute(socket, seq_id, &payload, &pool, &conn_state).await?;
-                }
-                0x19 => {
-                    Self::handle_com_stmt_close(&payload, &conn_state).await?;
-                }
-                0x16 => {
-                    println!("Client sent COM_STMT_RESET");
-                    socket.write_all(&Self::build_ok_packet(seq_id + 1, 0, 0)).await?;
-                    socket.flush().await?;
-                }
-                0x02 => {
-                    let db_name = String::from_utf8_lossy(&payload[1..]).to_string();
-                    println!("Client sent COM_INIT_DB: {}", db_name);
-                    socket.write_all(&Self::build_ok_packet(seq_id + 1, 0, 0)).await?;
-                    socket.flush().await?;
-                }
-                0x01 => {
-                    println!("Client sent COM_QUIT");
+                COM_QUIT => {
+                    if is_debug {
+                        println!("[DB Proxy] Client #{} sent COM_QUIT", conn_id);
+                    }
                     break;
                 }
-                0x0E => {
-                    socket.write_all(&Self::build_ok_packet(seq_id + 1, 0, 0)).await?;
+                COM_PING => {
+                    let pkt = build_ok_packet(seq_id.wrapping_add(1), 0, 0, session.status_flags());
+                    socket.write_all(&pkt).await?;
                     socket.flush().await?;
                 }
-                _ => {
-                    println!("Unknown command: 0x{:02X}", command);
+                COM_STATISTICS => {
+                    let stats_msg = format!("BakpiaRun Secure DB Proxy | ConnID: {}", conn_id);
+                    let pkt = build_packet(seq_id.wrapping_add(1), stats_msg.as_bytes());
+                    socket.write_all(&pkt).await?;
+                    socket.flush().await?;
+                }
+                COM_INIT_DB => {
+                    let db_name = String::from_utf8_lossy(&payload[1..]).trim().to_string();
+                    if is_debug {
+                        println!("[DB Proxy] COM_INIT_DB: {}", db_name);
+                    }
+                    // Validate safe identifier before issuing USE if pinned, otherwise acknowledge
+                    let valid_ident = !db_name.is_empty()
+                        && db_name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                    if valid_ident {
+                        let pkt =
+                            build_ok_packet(seq_id.wrapping_add(1), 0, 0, session.status_flags());
+                        socket.write_all(&pkt).await?;
+                    } else {
+                        let pkt = build_error_packet(
+                            seq_id.wrapping_add(1),
+                            1049,
+                            b"42000",
+                            "Unknown or invalid database name",
+                        );
+                        socket.write_all(&pkt).await?;
+                    }
+                    socket.flush().await?;
+                }
+                COM_QUERY => {
+                    Self::handle_com_query(socket, seq_id, &payload, &pool, &mut session, is_debug)
+                        .await?;
+                }
+                COM_STMT_PREPARE => {
+                    Self::handle_com_stmt_prepare(
+                        socket,
+                        seq_id,
+                        &payload,
+                        &pool,
+                        &mut session,
+                        is_debug,
+                    )
+                    .await?;
+                }
+                COM_STMT_EXECUTE => {
+                    Self::handle_com_stmt_execute(
+                        socket,
+                        seq_id,
+                        &payload,
+                        &pool,
+                        &mut session,
+                        is_debug,
+                    )
+                    .await?;
+                }
+                COM_STMT_SEND_LONG_DATA => {
+                    Self::handle_com_stmt_send_long_data(&payload, &mut session);
+                }
+                COM_STMT_CLOSE => {
+                    Self::handle_com_stmt_close(&payload, &mut session, is_debug);
+                }
+                COM_STMT_RESET => {
+                    Self::handle_com_stmt_reset(socket, seq_id, &payload, &mut session).await?;
+                }
+                unknown => {
+                    if is_debug {
+                        eprintln!(
+                            "[DB Proxy] Unsupported MySQL command 0x{:02X} on client #{}",
+                            unknown, conn_id
+                        );
+                    }
+                    // Always reply ERR_Packet so PHP client never hangs indefinitely
+                    let err_pkt = build_error_packet(
+                        seq_id.wrapping_add(1),
+                        1047,
+                        b"08S01",
+                        &format!("Unsupported command 0x{:02X}", unknown),
+                    );
+                    socket.write_all(&err_pkt).await?;
+                    socket.flush().await?;
                 }
             }
         }
+
+        // Cleanup: if client disconnected with an open uncommitted transaction, roll it back cleanly
+        // before returning the connection to the pool!
+        if let Some(mut conn) = session.pinned_conn.take() {
+            if session.in_explicit_tx || session.autocommit_disabled {
+                let _ = conn.query_drop("ROLLBACK").await;
+            }
+            if session.session_pinned {
+                let _ = conn.query_drop("UNLOCK TABLES").await;
+            }
+        }
+
         Ok(())
     }
 
     async fn handle_com_query(
-        socket: &mut tokio::net::TcpStream,
+        socket: &mut TcpStream,
         seq_id: u8,
         payload: &[u8],
         pool: &Pool,
+        session: &mut SessionState,
+        is_debug: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let query = String::from_utf8_lossy(&payload[1..]).to_string();
-        println!("[COM_QUERY]: {}", query);
+        if is_debug {
+            println!("[DB Proxy] [COM_QUERY]: {}", query);
+        }
 
-        match pool.get_conn().await {
-            Ok(mut conn) => {
-                match conn.query_iter(query.as_str()).await {
-                    Ok(mut result) => {
-                        let mut current_seq = seq_id + 1;
-                        let columns = result.columns().expect("Columns missing");
-                        let col_count = columns.len() as u64;
+        let intent = classify_sql_intent(&query);
 
-                        if col_count > 0 {
-                            socket.write_all(&Self::build_lenenc_int_packet(current_seq, col_count)).await?;
-                            current_seq += 1;
+        // Update pre-execution pinning intent
+        match intent {
+            TxIntent::Begin => session.in_explicit_tx = true,
+            TxIntent::SetAutocommitOff => session.autocommit_disabled = true,
+            TxIntent::PinSession => session.session_pinned = true,
+            _ => {}
+        }
 
-                            for col in columns.iter() {
-                                let name = col.name_str().to_string();
-                                let col_type = col.column_type();
-                                socket.write_all(&Self::build_column_def_packet(current_seq, &name, col_type)).await?;
-                                current_seq += 1;
-                            }
+        // Acquire either the session's pinned connection or a pooled connection
+        let mut conn: Conn = match session.pinned_conn.take() {
+            Some(c) => c,
+            None => match pool.get_conn().await {
+                Ok(c) => c,
+                Err(e) => {
+                    let (code, state, msg) = extract_mysql_error(&e);
+                    socket
+                        .write_all(&build_error_packet(seq_id.wrapping_add(1), code, &state, &msg))
+                        .await?;
+                    socket.flush().await?;
+                    return Ok(());
+                }
+            },
+        };
 
-                            socket.write_all(&Self::build_eof_packet(current_seq)).await?;
-                            current_seq += 1;
+        let mut io_broken = false;
+        {
+            let query_res = conn.query_iter(query.as_str()).await;
 
-                            while let Some(row) = result.next().await? {
-                                let values: Vec<mysql_async::Value> = row.unwrap();
-                                socket.write_all(&Self::build_row_packet(current_seq, &values)).await?;
-                                current_seq += 1;
-                            }
-
-                            socket.write_all(&Self::build_eof_packet(current_seq)).await?;
-                        } else {
-                            let affected_rows = result.affected_rows();
-                            let last_insert_id = result.last_insert_id().unwrap_or(0);
-                            socket.write_all(&Self::build_ok_packet(current_seq, affected_rows, last_insert_id)).await?;
-                        }
+            // Update post-execution transaction state
+            if query_res.is_ok() {
+                match intent {
+                    TxIntent::CommitOrRollback => {
+                        session.in_explicit_tx = false;
                     }
-                    Err(e) => {
-                        socket.write_all(&Self::build_error_packet(seq_id + 1, 1105, &format!("{}", e))).await?;
+                    TxIntent::SetAutocommitOn => {
+                        session.autocommit_disabled = false;
+                        session.in_explicit_tx = false;
                     }
+                    _ => {}
                 }
             }
-            Err(e) => {
-                socket.write_all(&Self::build_error_packet(seq_id + 1, 1105, &format!("{}", e))).await?;
+
+            let status_flags = session.status_flags();
+
+            match query_res {
+                Ok(mut result) => {
+                    let mut current_seq = seq_id.wrapping_add(1);
+                    let columns: Vec<mysql_async::Column> = result
+                        .columns()
+                        .map(|c| c.as_ref().to_vec())
+                        .unwrap_or_default();
+
+                    if !columns.is_empty() {
+                        let mut write_buf = Vec::with_capacity(8192);
+                        write_buf.extend_from_slice(&build_lenenc_int_packet(
+                            current_seq,
+                            columns.len() as u64,
+                        ));
+                        current_seq = current_seq.wrapping_add(1);
+
+                        for col in &columns {
+                            write_buf
+                                .extend_from_slice(&build_column_def_from_mysql(current_seq, col));
+                            current_seq = current_seq.wrapping_add(1);
+                        }
+
+                        write_buf.extend_from_slice(&build_eof_packet(current_seq, status_flags));
+                        current_seq = current_seq.wrapping_add(1);
+
+                        while let Some(row) = result.next().await? {
+                            let values = row.unwrap();
+                            write_buf
+                                .extend_from_slice(&build_text_row_packet(current_seq, &values));
+                            current_seq = current_seq.wrapping_add(1);
+
+                            if write_buf.len() >= 65536 {
+                                socket.write_all(&write_buf).await?;
+                                write_buf.clear();
+                            }
+                        }
+
+                        write_buf.extend_from_slice(&build_eof_packet(current_seq, status_flags));
+                        socket.write_all(&write_buf).await?;
+                    } else {
+                        let affected_rows = result.affected_rows();
+                        let last_insert_id = result.last_insert_id().unwrap_or(0);
+                        while (result.next().await?).is_some() {}
+                        socket
+                            .write_all(&build_ok_packet(
+                                current_seq,
+                                affected_rows,
+                                last_insert_id,
+                                status_flags,
+                            ))
+                            .await?;
+                    }
+                }
+                Err(e) => {
+                    if matches!(e, mysql_async::Error::Io(_)) {
+                        io_broken = true;
+                    }
+                    let (code, state, msg) = extract_mysql_error(&e);
+                    socket
+                        .write_all(&build_error_packet(seq_id.wrapping_add(1), code, &state, &msg))
+                        .await?;
+                }
             }
         }
+
+        // Keep connection pinned if inside active transaction, otherwise drop back to pool
+        if !io_broken && session.should_keep_pinned() {
+            session.pinned_conn = Some(conn);
+        }
+
         socket.flush().await?;
         Ok(())
     }
 
     async fn handle_com_stmt_prepare(
-        socket: &mut tokio::net::TcpStream,
+        socket: &mut TcpStream,
         seq_id: u8,
         payload: &[u8],
-        conn_state: &Arc<Mutex<ConnectionState>>,
+        pool: &Pool,
+        session: &mut SessionState,
+        is_debug: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let query = String::from_utf8_lossy(&payload[1..]).to_string();
-        println!("[COM_STMT_PREPARE]: {}", query);
-
-        let mut state = conn_state.lock().await;
-        let stmt_id = state.next_stmt_id;
-        state.next_stmt_id += 1;
-        state.statements.insert(stmt_id, query.clone());
-
-        let num_params = query.matches('?').count() as u16;
-        let num_columns: u16 = 0;
-
-        let mut current_seq = seq_id + 1;
-        
-        // Build STMT_PREPARE_OK packet (12 bytes payload)
-        let mut prepare_ok = Vec::new();
-        prepare_ok.push(0x00); // Status OK
-        prepare_ok.extend_from_slice(&stmt_id.to_le_bytes()); // 4 bytes
-        prepare_ok.extend_from_slice(&num_columns.to_le_bytes()); // 2 bytes
-        prepare_ok.extend_from_slice(&num_params.to_le_bytes()); // 2 bytes
-        prepare_ok.push(0x00); // Reserved
-        prepare_ok.extend_from_slice(&[0x00, 0x00]); // Warning count
-        
-        let packet = Self::build_packet(current_seq, &prepare_ok);
-        println!("COM_STMT_PREPARE response: {} bytes (payload: {} bytes)", packet.len(), prepare_ok.len());
-        
-        socket.write_all(&packet).await?;
-        current_seq += 1;
-
-        // Send parameter definitions (if any)
-        if num_params > 0 {
-            for i in 0..num_params {
-                socket.write_all(&Self::build_stmt_param_def_packet(current_seq, i as u32)).await?;
-                current_seq += 1;
-            }
-            socket.write_all(&Self::build_eof_packet(current_seq)).await?;
-            current_seq += 1;
+        if is_debug {
+            println!("[DB Proxy] [COM_STMT_PREPARE (0x16)]: {}", query);
         }
 
-        // Send EOF for columns (num_columns = 0)
-        socket.write_all(&Self::build_eof_packet(current_seq)).await?;
+        // Prepare directly on backend via mysql_async to validate SQL syntax and obtain
+        // exact parameter count & result column metadata (immune to '?' inside string literals!)
+        let mut conn: Conn = match session.pinned_conn.take() {
+            Some(c) => c,
+            None => match pool.get_conn().await {
+                Ok(c) => c,
+                Err(e) => {
+                    let (code, state, msg) = extract_mysql_error(&e);
+                    socket
+                        .write_all(&build_error_packet(seq_id.wrapping_add(1), code, &state, &msg))
+                        .await?;
+                    socket.flush().await?;
+                    return Ok(());
+                }
+            },
+        };
 
-        println!("Prepared statement {} created (params: {})", stmt_id, num_params);
-        
+        let backend_stmt = match conn.prep(query.as_str()).await {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                if !matches!(e, mysql_async::Error::Io(_)) && session.should_keep_pinned() {
+                    session.pinned_conn = Some(conn);
+                }
+                let (code, state, msg) = extract_mysql_error(&e);
+                socket
+                    .write_all(&build_error_packet(seq_id.wrapping_add(1), code, &state, &msg))
+                    .await?;
+                socket.flush().await?;
+                return Ok(());
+            }
+        };
+
+        if session.should_keep_pinned() {
+            session.pinned_conn = Some(conn);
+        }
+
+        let num_params = backend_stmt.params().len() as u16;
+        let columns: Vec<mysql_async::Column> = backend_stmt.columns().to_vec();
+        let num_columns = columns.len() as u16;
+
+        let stmt_id = session.next_stmt_id;
+        session.next_stmt_id = session.next_stmt_id.wrapping_add(1).max(1);
+        session.statements.insert(
+            stmt_id,
+            StoredStatement {
+                query,
+                num_params: num_params as usize,
+                param_types: Vec::new(),
+                long_data: HashMap::new(),
+            },
+        );
+
+        let status_flags = session.status_flags();
+        let mut current_seq = seq_id.wrapping_add(1);
+        let mut write_buf = Vec::with_capacity(512);
+
+        // 1. COM_STMT_PREPARE_OK (12 bytes payload)
+        let mut prepare_ok = Vec::with_capacity(12);
+        prepare_ok.push(0x00); // status OK
+        prepare_ok.extend_from_slice(&stmt_id.to_le_bytes()); // statement_id (4)
+        prepare_ok.extend_from_slice(&num_columns.to_le_bytes()); // num_columns (2)
+        prepare_ok.extend_from_slice(&num_params.to_le_bytes()); // num_params (2)
+        prepare_ok.push(0x00); // reserved_1 (1)
+        prepare_ok.extend_from_slice(&[0x00, 0x00]); // warning_count (2)
+
+        write_buf.extend_from_slice(&build_packet(current_seq, &prepare_ok));
+        current_seq = current_seq.wrapping_add(1);
+
+        // 2. Parameter Definition Block + EOF (ONLY when num_params > 0)
+        if num_params > 0 {
+            for _ in 0..num_params {
+                write_buf.extend_from_slice(&build_stmt_param_def_packet(current_seq));
+                current_seq = current_seq.wrapping_add(1);
+            }
+            write_buf.extend_from_slice(&build_eof_packet(current_seq, status_flags));
+            current_seq = current_seq.wrapping_add(1);
+        }
+
+        // 3. Column Definition Block + EOF (ONLY when num_columns > 0 — MySQL Spec!)
+        if num_columns > 0 {
+            for col in &columns {
+                write_buf.extend_from_slice(&build_column_def_from_mysql(current_seq, col));
+                current_seq = current_seq.wrapping_add(1);
+            }
+            write_buf.extend_from_slice(&build_eof_packet(current_seq, status_flags));
+        }
+
+        socket.write_all(&write_buf).await?;
         socket.flush().await?;
         Ok(())
     }
 
     async fn handle_com_stmt_execute(
-        socket: &mut tokio::net::TcpStream,
+        socket: &mut TcpStream,
         seq_id: u8,
         payload: &[u8],
         pool: &Pool,
-        conn_state: &Arc<Mutex<ConnectionState>>,
+        session: &mut SessionState,
+        is_debug: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if payload.len() < 5 {
-            socket.write_all(&Self::build_error_packet(seq_id + 1, 1105, "Invalid COM_STMT_EXECUTE packet")).await?;
+        if payload.len() < 10 {
+            socket
+                .write_all(&build_error_packet(
+                    seq_id.wrapping_add(1),
+                    1210,
+                    b"HY000",
+                    "Malformed COM_STMT_EXECUTE packet",
+                ))
+                .await?;
             socket.flush().await?;
             return Ok(());
         }
 
         let stmt_id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-        println!("[COM_STMT_EXECUTE]: statement_id={}", stmt_id);
 
-        let state = conn_state.lock().await;
-        let query = match state.statements.get(&stmt_id) {
-            Some(q) => q.clone(),
-            None => {
-                socket.write_all(&Self::build_error_packet(seq_id + 1, 1105, "Statement not found")).await?;
-                socket.flush().await?;
-                return Ok(());
-            }
-        };
-        let num_params = query.matches('?').count();
-        drop(state);
+        let (query, param_values) = {
+            let stored = match session.statements.get_mut(&stmt_id) {
+                Some(s) => s,
+                None => {
+                    socket
+                        .write_all(&build_error_packet(
+                            seq_id.wrapping_add(1),
+                            1243,
+                            b"HY000",
+                            "Unknown prepared statement handler given to mysqld_stmt_execute",
+                        ))
+                        .await?;
+                    socket.flush().await?;
+                    return Ok(());
+                }
+            };
 
-        // Parse binary parameters
-        let params = Self::parse_binary_parameters_safe(&payload[5..], num_params);
-        
-        // Substitute parameters into query
-        let final_query = Self::substitute_parameters(&query, &params);
-        println!("[EXECUTED AS]: {}", final_query);
-
-        // Execute as COM_QUERY
-        match pool.get_conn().await {
-            Ok(mut conn) => {
-                match conn.query_iter(final_query.as_str()).await {
-                    Ok(mut result) => {
-                        let mut current_seq = seq_id + 1;
-                        let columns = result.columns().expect("Columns missing");
-                        let col_count = columns.len() as u64;
-
-                        if col_count > 0 {
-                            socket.write_all(&Self::build_lenenc_int_packet(current_seq, col_count)).await?;
-                            current_seq += 1;
-
-                            for col in columns.iter() {
-                                let name = col.name_str().to_string();
-                                let col_type = col.column_type();
-                                socket.write_all(&Self::build_column_def_packet(current_seq, &name, col_type)).await?;
-                                current_seq += 1;
-                            }
-
-                            socket.write_all(&Self::build_eof_packet(current_seq)).await?;
-                            current_seq += 1;
-
-                            while let Some(row) = result.next().await? {
-                                let values: Vec<mysql_async::Value> = row.unwrap();
-                                socket.write_all(&Self::build_row_packet_binary(current_seq, &values)).await?;
-                                current_seq += 1;
-                            }
-
-                            socket.write_all(&Self::build_eof_packet(current_seq)).await?;
-                        } else {
-                            let affected_rows = result.affected_rows();
-                            let last_insert_id = result.last_insert_id().unwrap_or(0);
-                            socket.write_all(&Self::build_ok_packet(current_seq, affected_rows, last_insert_id)).await?;
-                        }
-                    }
-                    Err(e) => {
-                        socket.write_all(&Self::build_error_packet(seq_id + 1, 1105, &format!("{}", e))).await?;
-                    }
+            match decode_stmt_execute_params(
+                payload,
+                stored.num_params,
+                &mut stored.param_types,
+                &stored.long_data,
+            ) {
+                Ok(vals) => {
+                    stored.long_data.clear();
+                    (stored.query.clone(), vals)
+                }
+                Err(parse_err) => {
+                    socket
+                        .write_all(&build_error_packet(
+                            seq_id.wrapping_add(1),
+                            1210,
+                            b"HY000",
+                            &parse_err,
+                        ))
+                        .await?;
+                    socket.flush().await?;
+                    return Ok(());
                 }
             }
-            Err(e) => {
-                socket.write_all(&Self::build_error_packet(seq_id + 1, 1105, &format!("{}", e))).await?;
+        };
+
+        if is_debug {
+            println!(
+                "[DB Proxy] [COM_STMT_EXECUTE (0x17)] stmt_id={} params={}",
+                stmt_id,
+                param_values.len()
+            );
+        }
+
+        // Acquire session-pinned or pooled connection and execute natively via binary protocol (100% SQLi-safe!)
+        let mut conn: Conn = match session.pinned_conn.take() {
+            Some(c) => c,
+            None => match pool.get_conn().await {
+                Ok(c) => c,
+                Err(e) => {
+                    let (code, state, msg) = extract_mysql_error(&e);
+                    socket
+                        .write_all(&build_error_packet(seq_id.wrapping_add(1), code, &state, &msg))
+                        .await?;
+                    socket.flush().await?;
+                    return Ok(());
+                }
+            },
+        };
+
+        let mysql_params = if param_values.is_empty() {
+            Params::Empty
+        } else {
+            Params::Positional(param_values)
+        };
+
+        let status_flags = session.status_flags();
+        let mut io_broken = false;
+
+        {
+            match conn.exec_iter(query.as_str(), mysql_params).await {
+                Ok(mut result) => {
+                    let mut current_seq = seq_id.wrapping_add(1);
+                    let columns: Vec<mysql_async::Column> = result
+                        .columns()
+                        .map(|c| c.as_ref().to_vec())
+                        .unwrap_or_default();
+
+                    if !columns.is_empty() {
+                        let mut write_buf = Vec::with_capacity(8192);
+                        write_buf.extend_from_slice(&build_lenenc_int_packet(
+                            current_seq,
+                            columns.len() as u64,
+                        ));
+                        current_seq = current_seq.wrapping_add(1);
+
+                        for col in &columns {
+                            write_buf
+                                .extend_from_slice(&build_column_def_from_mysql(current_seq, col));
+                            current_seq = current_seq.wrapping_add(1);
+                        }
+
+                        write_buf.extend_from_slice(&build_eof_packet(current_seq, status_flags));
+                        current_seq = current_seq.wrapping_add(1);
+
+                        while let Some(row) = result.next().await? {
+                            let values = row.unwrap();
+                            write_buf.extend_from_slice(&build_binary_row_packet(
+                                current_seq,
+                                &columns,
+                                &values,
+                            ));
+                            current_seq = current_seq.wrapping_add(1);
+
+                            if write_buf.len() >= 65536 {
+                                socket.write_all(&write_buf).await?;
+                                write_buf.clear();
+                            }
+                        }
+
+                        write_buf.extend_from_slice(&build_eof_packet(current_seq, status_flags));
+                        socket.write_all(&write_buf).await?;
+                    } else {
+                        let affected_rows = result.affected_rows();
+                        let last_insert_id = result.last_insert_id().unwrap_or(0);
+                        while (result.next().await?).is_some() {}
+                        socket
+                            .write_all(&build_ok_packet(
+                                current_seq,
+                                affected_rows,
+                                last_insert_id,
+                                status_flags,
+                            ))
+                            .await?;
+                    }
+                }
+                Err(e) => {
+                    if matches!(e, mysql_async::Error::Io(_)) {
+                        io_broken = true;
+                    }
+                    let (code, state, msg) = extract_mysql_error(&e);
+                    socket
+                        .write_all(&build_error_packet(seq_id.wrapping_add(1), code, &state, &msg))
+                        .await?;
+                }
             }
         }
+
+        if !io_broken && session.should_keep_pinned() {
+            session.pinned_conn = Some(conn);
+        }
+
         socket.flush().await?;
         Ok(())
     }
 
-    async fn handle_com_stmt_close(
+    fn handle_com_stmt_send_long_data(payload: &[u8], session: &mut SessionState) {
+        // [0x18 (1)] + [stmt_id (4)] + [param_id (2)] + [data...]
+        if payload.len() >= 7 {
+            let stmt_id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            let param_id = u16::from_le_bytes([payload[5], payload[6]]);
+            if let Some(stored) = session.statements.get_mut(&stmt_id) {
+                stored
+                    .long_data
+                    .entry(param_id)
+                    .or_default()
+                    .extend_from_slice(&payload[7..]);
+            }
+        }
+    }
+
+    fn handle_com_stmt_close(payload: &[u8], session: &mut SessionState, is_debug: bool) {
+        if payload.len() >= 5 {
+            let stmt_id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            if is_debug {
+                println!("[DB Proxy] [COM_STMT_CLOSE (0x19)]: stmt_id={}", stmt_id);
+            }
+            session.statements.remove(&stmt_id);
+        }
+    }
+
+    async fn handle_com_stmt_reset(
+        socket: &mut TcpStream,
+        seq_id: u8,
         payload: &[u8],
-        conn_state: &Arc<Mutex<ConnectionState>>,
+        session: &mut SessionState,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if payload.len() >= 5 {
             let stmt_id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-            println!("[COM_STMT_CLOSE]: statement_id={}", stmt_id);
-            
-            let mut state = conn_state.lock().await;
-            state.statements.remove(&stmt_id);
+            if let Some(stored) = session.statements.get_mut(&stmt_id) {
+                stored.long_data.clear();
+            }
         }
+        socket
+            .write_all(&build_ok_packet(
+                seq_id.wrapping_add(1),
+                0,
+                0,
+                session.status_flags(),
+            ))
+            .await?;
+        socket.flush().await?;
         Ok(())
-    }
-
-    fn parse_binary_parameters_safe(payload: &[u8], num_params: usize) -> Vec<String> {
-        if num_params == 0 || payload.len() < 6 {
-            return vec![];
-        }
-
-        let mut params = Vec::new();
-        let mut offset = 5;
-
-        let bitmap_len = (num_params + 7) / 8;
-        if payload.len() < offset + bitmap_len {
-            return vec!["NULL".to_string(); num_params];
-        }
-        let null_bitmap = &payload[offset..offset + bitmap_len];
-        offset += bitmap_len;
-
-        if payload.len() <= offset {
-            return vec!["NULL".to_string(); num_params];
-        }
-        let new_params_bound = payload[offset] == 1;
-        offset += 1;
-
-        let mut types = vec![0xfd; num_params];
-        if new_params_bound && payload.len() >= offset + num_params * 2 {
-            for i in 0..num_params {
-                types[i] = payload[offset + i * 2];
-            }
-            offset += num_params * 2;
-        }
-
-        for i in 0..num_params {
-            let byte_idx = i / 8;
-            let bit_idx = i % 8;
-            if null_bitmap[byte_idx] & (1 << bit_idx) != 0 {
-                params.push("NULL".to_string());
-                continue;
-            }
-
-            if offset >= payload.len() {
-                params.push("NULL".to_string());
-                continue;
-            }
-
-            let param_type = types[i];
-            match param_type {
-                0x01 => {
-                    if offset < payload.len() {
-                        let val = payload[offset] as i8;
-                        params.push(val.to_string());
-                        offset += 1;
-                    } else {
-                        params.push("NULL".to_string());
-                    }
-                }
-                0x02 | 0x03 => {
-                    if offset + 4 <= payload.len() {
-                        let val = i32::from_le_bytes([
-                            payload[offset],
-                            payload[offset + 1],
-                            payload[offset + 2],
-                            payload[offset + 3],
-                        ]);
-                        params.push(val.to_string());
-                        offset += 4;
-                    } else {
-                        params.push("NULL".to_string());
-                    }
-                }
-                0x08 => {
-                    if offset + 8 <= payload.len() {
-                        let val = i64::from_le_bytes([
-                            payload[offset],
-                            payload[offset + 1],
-                            payload[offset + 2],
-                            payload[offset + 3],
-                            payload[offset + 4],
-                            payload[offset + 5],
-                            payload[offset + 6],
-                            payload[offset + 7],
-                        ]);
-                        params.push(val.to_string());
-                        offset += 8;
-                    } else {
-                        params.push("NULL".to_string());
-                    }
-                }
-                _ => {
-                    let (val, new_offset) = Self::read_lenenc_string_safe(&payload[offset..]);
-                    params.push(format!("'{}'", val.replace("'", "''")));
-                    offset = new_offset;
-                }
-            }
-        }
-
-        params
-    }
-
-    fn read_lenenc_string_safe(data: &[u8]) -> (String, usize) {
-        if data.is_empty() {
-            return ("".to_string(), 0);
-        }
-
-        let first_byte = data[0];
-        let (len, offset) = if first_byte < 251 {
-            (first_byte as usize, 1)
-        } else if first_byte == 0xfc && data.len() >= 3 {
-            ((data[1] as usize) | ((data[2] as usize) << 8), 3)
-        } else if first_byte == 0xfd && data.len() >= 4 {
-            ((data[1] as usize) | ((data[2] as usize) << 8) | ((data[3] as usize) << 16), 4)
-        } else {
-            return ("".to_string(), 0);
-        };
-
-        if data.len() < offset + len {
-            return ("".to_string(), data.len());
-        }
-
-        let val = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
-        (val, offset + len)
-    }
-
-    fn substitute_parameters(query: &str, params: &[String]) -> String {
-        let mut result = query.to_string();
-        for param in params {
-            result = result.replacen('?', param, 1);
-        }
-        result
-    }
-
-    fn generate_scramble() -> Vec<u8> {
-        use std::time::SystemTime;
-        let seed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos() as u64;
-        let mut scramble = Vec::with_capacity(20);
-        for i in 0..20 {
-            scramble.push(((seed >> (i % 8)) & 0xFF) as u8);
-        }
-        scramble
-    }
-
-    fn build_packet(seq_id: u8, payload: &[u8]) -> Vec<u8> {
-        let len = payload.len();
-        let mut packet = Vec::with_capacity(4 + len);
-        packet.push((len & 0xFF) as u8);
-        packet.push(((len >> 8) & 0xFF) as u8);
-        packet.push(((len >> 16) & 0xFF) as u8);
-        packet.push(seq_id);
-        packet.extend_from_slice(payload);
-        packet
-    }
-
-    fn build_handshake_v10(scramble: &[u8], version: &str) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.push(10);
-        let version_str = format!("{}\0", version);
-        payload.extend_from_slice(version_str.as_bytes());
-        payload.extend_from_slice(&[1, 0, 0, 0]);
-        payload.extend_from_slice(&scramble[..8]);
-        payload.push(0);
-        payload.extend_from_slice(&[0xFF, 0xC1]);
-        payload.push(0x21);
-        payload.extend_from_slice(&[0x02, 0x00]);
-        payload.extend_from_slice(&[0x00, 0x80]);
-        payload.push(21);
-        payload.extend_from_slice(&[0; 10]);
-        payload.extend_from_slice(&scramble[8..20]);
-        payload.push(0);
-        payload.extend_from_slice(b"mysql_native_password\0");
-        Self::build_packet(0, &payload)
-    }
-
-    fn build_ok_packet(seq_id: u8, affected_rows: u64, last_insert_id: u64) -> Vec<u8> {
-        let mut payload = vec![0x00];
-        payload.extend_from_slice(&Self::lenenc_int(affected_rows));
-        payload.extend_from_slice(&Self::lenenc_int(last_insert_id));
-        payload.extend_from_slice(&[0x02, 0x00]);
-        payload.extend_from_slice(&[0x00, 0x00]);
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn build_ok_packet_after_handshake(seq_id: u8) -> Vec<u8> {
-        let mut payload = vec![0x00];
-        payload.extend_from_slice(&Self::lenenc_int(0));
-        payload.extend_from_slice(&Self::lenenc_int(0));
-        payload.extend_from_slice(&[0x02, 0x00]);
-        payload.extend_from_slice(&[0x00, 0x00]);
-        payload.extend_from_slice(&Self::lenenc_str(b""));
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn build_error_packet(seq_id: u8, code: u16, msg: &str) -> Vec<u8> {
-        let mut payload = vec![0xff];
-        payload.push((code & 0xFF) as u8);
-        payload.push(((code >> 8) & 0xFF) as u8);
-        payload.extend_from_slice(b"#HY000");
-        payload.extend_from_slice(msg.as_bytes());
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn build_eof_packet(seq_id: u8) -> Vec<u8> {
-        let payload = vec![0xfe, 0x00, 0x00, 0x02, 0x00];
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn build_lenenc_int_packet(seq_id: u8, val: u64) -> Vec<u8> {
-        let payload = Self::lenenc_int(val);
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn build_column_def_packet(seq_id: u8, name: &str, col_type: mysql_async::consts::ColumnType) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&Self::lenenc_str(b"def"));
-        payload.extend_from_slice(&Self::lenenc_str(b""));
-        payload.extend_from_slice(&Self::lenenc_str(b""));
-        payload.extend_from_slice(&Self::lenenc_str(b""));
-        payload.extend_from_slice(&Self::lenenc_str(name.as_bytes()));
-        payload.extend_from_slice(&Self::lenenc_str(name.as_bytes()));
-        payload.push(0x0c);
-        payload.extend_from_slice(&[0x21, 0x00]);
-        payload.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
-        payload.push(Self::map_column_type(col_type));
-        payload.extend_from_slice(&[0x00, 0x00]);
-        payload.push(0x00);
-        payload.extend_from_slice(&[0x00, 0x00]);
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn build_row_packet(seq_id: u8, values: &[mysql_async::Value]) -> Vec<u8> {
-        let mut payload = Vec::new();
-        for val in values {
-            match val {
-                mysql_async::Value::NULL => payload.push(0xfb),
-                mysql_async::Value::Bytes(b) => payload.extend_from_slice(&Self::lenenc_str(b)),
-                mysql_async::Value::Int(i) => payload.extend_from_slice(&Self::lenenc_str(i.to_string().as_bytes())),
-                mysql_async::Value::UInt(u) => payload.extend_from_slice(&Self::lenenc_str(u.to_string().as_bytes())),
-                mysql_async::Value::Float(f) => payload.extend_from_slice(&Self::lenenc_str(f.to_string().as_bytes())),
-                mysql_async::Value::Double(d) => payload.extend_from_slice(&Self::lenenc_str(d.to_string().as_bytes())),
-                _ => payload.extend_from_slice(&Self::lenenc_str(b"?")),
-            }
-        }
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn build_row_packet_binary(seq_id: u8, values: &[mysql_async::Value]) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.push(0x00);
-        let null_bitmap_len = (values.len() + 7) / 8;
-        payload.extend_from_slice(&vec![0u8; null_bitmap_len]);
-        
-        for val in values {
-            match val {
-                mysql_async::Value::NULL => {},
-                mysql_async::Value::Bytes(b) => payload.extend_from_slice(&Self::lenenc_str(b)),
-                mysql_async::Value::Int(i) => payload.extend_from_slice(&i.to_le_bytes()),
-                mysql_async::Value::UInt(u) => payload.extend_from_slice(&u.to_le_bytes()),
-                mysql_async::Value::Float(f) => payload.extend_from_slice(&f.to_le_bytes()),
-                mysql_async::Value::Double(d) => payload.extend_from_slice(&d.to_le_bytes()),
-                _ => payload.extend_from_slice(&Self::lenenc_str(b"?")),
-            }
-        }
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn build_stmt_param_def_packet(seq_id: u8, param_num: u32) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&Self::lenenc_str(b"def"));
-        payload.extend_from_slice(&Self::lenenc_str(b""));
-        payload.extend_from_slice(&Self::lenenc_str(b""));
-        payload.extend_from_slice(&Self::lenenc_str(b""));
-        payload.extend_from_slice(&Self::lenenc_str(format!("?{}", param_num).as_bytes()));
-        payload.extend_from_slice(&Self::lenenc_str(format!("?{}", param_num).as_bytes()));
-        payload.push(0x0c);
-        payload.extend_from_slice(&[0x21, 0x00]);
-        payload.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
-        payload.push(0xfd);
-        payload.extend_from_slice(&[0x00, 0x00]);
-        payload.push(0x00);
-        payload.extend_from_slice(&[0x00, 0x00]);
-        Self::build_packet(seq_id, &payload)
-    }
-
-    fn lenenc_int(val: u64) -> Vec<u8> {
-        if val < 251 {
-            vec![val as u8]
-        } else if val < 65536 {
-            vec![0xfc, val as u8, (val >> 8) as u8]
-        } else if val < 16777216 {
-            vec![0xfd, val as u8, (val >> 8) as u8, (val >> 16) as u8]
-        } else {
-            vec![0xfe, val as u8, (val >> 8) as u8, (val >> 16) as u8, (val >> 24) as u8, (val >> 32) as u8, (val >> 40) as u8, (val >> 48) as u8, (val >> 56) as u8]
-        }
-    }
-
-    fn lenenc_str(data: &[u8]) -> Vec<u8> {
-        let mut res = Self::lenenc_int(data.len() as u64);
-        res.extend_from_slice(data);
-        res
-    }
-
-    fn map_column_type(t: mysql_async::consts::ColumnType) -> u8 {
-        use mysql_async::consts::ColumnType;
-        match t {
-            ColumnType::MYSQL_TYPE_TINY => 1,
-            ColumnType::MYSQL_TYPE_SHORT => 2,
-            ColumnType::MYSQL_TYPE_LONG => 3,
-            ColumnType::MYSQL_TYPE_FLOAT => 4,
-            ColumnType::MYSQL_TYPE_DOUBLE => 5,
-            ColumnType::MYSQL_TYPE_NULL => 6,
-            ColumnType::MYSQL_TYPE_LONGLONG => 8,
-            ColumnType::MYSQL_TYPE_INT24 => 9,
-            ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE => 10,
-            ColumnType::MYSQL_TYPE_TIME => 11,
-            ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_TIMESTAMP => 12,
-            ColumnType::MYSQL_TYPE_YEAR => 13,
-            ColumnType::MYSQL_TYPE_VARCHAR | ColumnType::MYSQL_TYPE_VAR_STRING => 15,
-            ColumnType::MYSQL_TYPE_BIT => 16,
-            ColumnType::MYSQL_TYPE_JSON => 245,
-            ColumnType::MYSQL_TYPE_NEWDECIMAL => 246,
-            ColumnType::MYSQL_TYPE_ENUM => 247,
-            ColumnType::MYSQL_TYPE_SET => 248,
-            ColumnType::MYSQL_TYPE_BLOB | ColumnType::MYSQL_TYPE_TINY_BLOB | 
-            ColumnType::MYSQL_TYPE_MEDIUM_BLOB | ColumnType::MYSQL_TYPE_LONG_BLOB => 252,
-            ColumnType::MYSQL_TYPE_STRING => 253,
-            ColumnType::MYSQL_TYPE_GEOMETRY => 255,
-            _ => 253,
-        }
     }
 }
