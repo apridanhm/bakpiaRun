@@ -1,0 +1,113 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  https_port: 8443
+  admin_token: "bench-secret-token"
+  max_body_size_mb: 50
+  static_cache_max_age: 31536000
+  tls:
+    enabled: false
+    cert_path: "/app/certs/cert.pem"
+    key_path: "/app/certs/key.pem"
+
+php:
+  binary_path: "php"
+  docroot: "/app/public"
+  worker_path: "/app/src-worker/worker.php"
+  worker_count: 20
+  memory_limit_mb: 64
+  max_requests: 5000
+  timeout_ms: 30000
+  connection_pool_size: 1
+  upload_tmp_dir: "/tmp/bakpiarun_uploads"
+  max_payload_mb: 100
+  worker_startup_delay_ms: 500
+  rolling_restart_delay_ms: 100
+  default_content_type: "text/html; charset=utf-8"
+  disable_functions: "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
+  open_basedir_docroot: true
+
+socket:
+  directory: "/tmp/bakpiarun"
+
+logging:
+  # Dinonaktifkan saat benchmark (setara access_log off pada Nginx & FrankenPHP)
+  access_log_enabled: false
+  access_log: "/dev/stdout"
+  error_log_enabled: true
+  error_log: "/dev/stderr"
+  level: "info"
+
+rate_limit:
+  enabled: false
+  requests_per_minute: 60000
+  burst_size: 5000
+
+security:
+  x_frame_options: "DENY"
+  x_content_type_options: true
+  x_xss_protection: true
+  referrer_policy: "strict-origin-when-cross-origin"
+
+compression:
+  enabled: false
+  min_size_bytes: 1024
+  level: 6
+
+# Proactive Anti-OOM Engine untuk kontainer 384 MB
+anti_oom:
+  enabled: true
+  check_interval_ms: 500
+  worker_threshold_percent: 75
+  cgroup_threshold_percent: 80
+  cgroup_memory_current_path: "/sys/fs/cgroup/memory.current"
+  cgroup_memory_max_path: "/sys/fs/cgroup/memory.max"
+
+# Total kapasitas konkurensi = 20 pekerja (4 Heavy + 16 Fast), identik dengan PHP-FPM & FrankenPHP
+pools:
+  - name: "heavy"
+    worker_count: 4
+    memory_limit_mb: 96
+    max_requests: 200
+    timeout_ms: 60000
+    headers:
+      X-Workload: "heavy"
+      X-Pool: "heavy"
+    patterns:
+      - "/heavy-db.php"
+      - "/heavy-*"
+      - "/bench/heavy*"
+      - "/bench/leak*"
+      - "/api/export/*"
+      - "/api/report/*"
+
+  - name: "fast"
+    worker_count: 16
+    memory_limit_mb: 64
+    max_requests: 5000
+    timeout_ms: 15000
+    headers:
+      X-Workload: "light"
+      X-Pool: "fast"
+    patterns:
+      - "/*"
+
+queue:
+  enabled: false
+  max_jobs: 10000
+  poll_interval_ms: 500
+
+db_proxy:
+  enabled: false
+  listen_address: "127.0.0.1"
+  listen_port: 3307
+  spoof_version: "8.0.33-bakpiarun-proxy"
+  target:
+    host: "127.0.0.1"
+    port: 3306
+    username: "bakpiarun_user"
+    password: "change_me"
+    database: "bakpiarun_db"
+  pool:
+    min_connections: 2
+    max_connections: 20

@@ -95,6 +95,8 @@ pools:
     patterns:
       - "/heavy-db.php"
       - "/heavy-*"
+      - "/bench/heavy*"
+      - "/bench/leak*"
       - "/api/export/*"
       - "/api/report/*"
   

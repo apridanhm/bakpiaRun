@@ -29,8 +29,9 @@ Dockerfile
 config/*.example.yaml
 config/*.bak
 
-# Tests & docs (nggak perlu di runtime image)
+# Tests, benchmark results & docs (nggak perlu di runtime image)
 tests/
+benchmarks/results/
 docs/
 *.md
 CHANGELOG.md

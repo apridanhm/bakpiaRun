@@ -1,0 +1,44 @@
+# ==============================================================================
+# LAB KOMPARASI TESIS S2: BakpiaRun vs Nginx+PHP-FPM vs FrankenPHP
+# Seluruh kontainer dibatasi identik pada cgroups v2: 2.0 vCPU & 384 MB RAM (No Swap)
+# dan melayani direktori /app/public yang 100% sama dengan kapasitas 20 pekerja.
+# ==============================================================================
+
+services:
+  bakpiarun:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: bench-bakpiarun
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./configs/bakpiarun.bench.yaml:/app/config/bakpiarun.yaml:ro
+    cpus: 2.0
+    mem_limit: 384m
+    memswap_limit: 384m
+    restart: "no"
+
+  phpfpm:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile.phpfpm
+    container_name: bench-phpfpm
+    ports:
+      - "8082:8080"
+    cpus: 2.0
+    mem_limit: 384m
+    memswap_limit: 384m
+    restart: "no"
+
+  frankenphp:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile.frankenphp
+    container_name: bench-frankenphp
+    ports:
+      - "8083:8080"
+    cpus: 2.0
+    mem_limit: 384m
+    memswap_limit: 384m
+    restart: "no"

@@ -1,0 +1,19 @@
+FROM dunglas/frankenphp:1-php8.3-alpine
+
+RUN install-php-extensions opcache pcntl
+
+# Konfigurasi Zend OPcache identik dengan BakpiaRun & PHP-FPM
+RUN printf '%s\n' \
+    'memory_limit=128M' \
+    'opcache.enable=1' \
+    'opcache.enable_cli=1' \
+    'opcache.memory_consumption=128' \
+    'opcache.interned_strings_buffer=16' \
+    'opcache.max_accelerated_files=10000' \
+    'opcache.validate_timestamps=0' \
+    > "$PHP_INI_DIR/conf.d/99-bench-opcache.ini"
+
+COPY benchmarks/configs/Caddyfile /etc/caddy/Caddyfile
+COPY public/ /app/public/
+
+EXPOSE 8080

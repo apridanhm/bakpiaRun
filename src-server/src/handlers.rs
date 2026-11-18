@@ -17,6 +17,7 @@ use crate::static_file;
 use crate::config::Config;
 use crate::security::apply_security_headers;
 use crate::anti_oom::read_cgroup_v2_memory;
+use crate::metrics::{LatencySummary, LATENCY_BUCKETS_MS};
 
 
 #[derive(Deserialize)]
@@ -342,7 +343,9 @@ pub async fn php_handler(
 
     match result {
         Ok(Ok(php_response)) => {
-            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let elapsed = start_time.elapsed();
+            let duration_ms = elapsed.as_millis() as u64;
+            let duration_us = elapsed.as_micros() as u64;
             state.logger.log_access(
                 &client_ip,
                 &method.to_string(),
@@ -353,7 +356,11 @@ pub async fn php_handler(
 
             {
                 let mut metrics = state.metrics.lock().await;
-                metrics.record_request(worker_index, php_response.memory);
+                if php_response.status >= 500 {
+                    metrics.record_pool_error(&pool_name, duration_us);
+                } else {
+                    metrics.record_pool_request(&pool_name, duration_us);
+                }
             }
 
             // UPDATE stats worker (/proc/[pid]/status VmRSS + PHP memory) tanpa mengunci seluruh pool
@@ -425,7 +432,9 @@ pub async fn php_handler(
                 .into_response()
         }
         Ok(Err(e)) => {
-            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let elapsed = start_time.elapsed();
+            let duration_ms = elapsed.as_millis() as u64;
+            let duration_us = elapsed.as_micros() as u64;
             state.logger.log_error(
                 "ERROR",
                 &format!("Worker #{} in pool '{}' failed: {} (URI: {})", worker_index, pool_name, e, uri),
@@ -434,7 +443,7 @@ pub async fn php_handler(
 
             {
                 let mut metrics = state.metrics.lock().await;
-                metrics.record_error();
+                metrics.record_pool_error(&pool_name, duration_us);
             }
             eprintln!("[Pool:{}] Worker #{} Error: {}", pool_name, worker_index, e);
             {
@@ -447,7 +456,9 @@ pub async fn php_handler(
             ).into_response()
         }
         Err(_) => {
-            let duration_ms = start_time.elapsed().as_millis() as u64;
+            let elapsed = start_time.elapsed();
+            let duration_ms = elapsed.as_millis() as u64;
+            let duration_us = elapsed.as_micros() as u64;
             state.logger.log_error(
                 "ERROR",
                 &format!("Request timeout after {}ms (URI: {})", pool_config.php.timeout_ms, uri),
@@ -456,7 +467,7 @@ pub async fn php_handler(
 
             {
                 let mut metrics = state.metrics.lock().await;
-                metrics.record_error();
+                metrics.record_pool_error(&pool_name, duration_us);
             }
             
             let worker_for_recycle = worker_arc.clone();
@@ -528,12 +539,31 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
             }));
         }
         
+        let (pool_requests, pool_errors, latency_summary) = match metrics.pools.get(pool_name) {
+            Some(pm_stats) => (pm_stats.requests, pm_stats.errors, pm_stats.summary()),
+            None => (
+                0,
+                0,
+                LatencySummary {
+                    samples: 0,
+                    avg_ms: 0.0,
+                    p50_ms: 0.0,
+                    p95_ms: 0.0,
+                    p99_ms: 0.0,
+                    max_ms: 0.0,
+                },
+            ),
+        };
+
         all_pools_info.push(serde_json::json!({
             "name": pool_name,
             "total": pool.workers.len(),
             "healthy": pool_healthy,
             "memory_limit_mb": pool.config.php.memory_limit_mb,
             "worker_threshold_percent": pool.config.anti_oom.worker_threshold_percent,
+            "pool_requests": pool_requests,
+            "pool_errors": pool_errors,
+            "latency": latency_summary,
             "workers": pool_workers_info,
         }));
     }
@@ -610,6 +640,70 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response {
     output.push_str("# HELP bakpiarun_cgroup_memory_usage_percent Container cgroups v2 memory usage percentage\n");
     output.push_str("# TYPE bakpiarun_cgroup_memory_usage_percent gauge\n");
     output.push_str(&format!("bakpiarun_cgroup_memory_usage_percent{{source=\"{}\"}} {:.2}\n\n", cgroup_mem.source, cgroup_mem.usage_percent));
+
+    output.push_str("# HELP bakpiarun_pool_requests_total Total requests routed to each workload pool\n");
+    output.push_str("# TYPE bakpiarun_pool_requests_total counter\n");
+    for pool_name in pm.pools.keys() {
+        let count = metrics.pools.get(pool_name).map(|p| p.requests).unwrap_or(0);
+        output.push_str(&format!("bakpiarun_pool_requests_total{{pool=\"{}\"}} {}\n", pool_name, count));
+    }
+    output.push('\n');
+
+    output.push_str("# HELP bakpiarun_pool_errors_total Total errors per workload pool\n");
+    output.push_str("# TYPE bakpiarun_pool_errors_total counter\n");
+    for pool_name in pm.pools.keys() {
+        let count = metrics.pools.get(pool_name).map(|p| p.errors).unwrap_or(0);
+        output.push_str(&format!("bakpiarun_pool_errors_total{{pool=\"{}\"}} {}\n", pool_name, count));
+    }
+    output.push('\n');
+
+    output.push_str("# HELP bakpiarun_pool_latency_ms Sliding-window request latency percentiles per pool in milliseconds\n");
+    output.push_str("# TYPE bakpiarun_pool_latency_ms gauge\n");
+    for pool_name in pm.pools.keys() {
+        let summary = metrics
+            .pools
+            .get(pool_name)
+            .map(|p| p.summary())
+            .unwrap_or(LatencySummary {
+                samples: 0,
+                avg_ms: 0.0,
+                p50_ms: 0.0,
+                p95_ms: 0.0,
+                p99_ms: 0.0,
+                max_ms: 0.0,
+            });
+        output.push_str(&format!("bakpiarun_pool_latency_ms{{pool=\"{}\",quantile=\"0.50\"}} {:.2}\n", pool_name, summary.p50_ms));
+        output.push_str(&format!("bakpiarun_pool_latency_ms{{pool=\"{}\",quantile=\"0.95\"}} {:.2}\n", pool_name, summary.p95_ms));
+        output.push_str(&format!("bakpiarun_pool_latency_ms{{pool=\"{}\",quantile=\"0.99\"}} {:.2}\n", pool_name, summary.p99_ms));
+        output.push_str(&format!("bakpiarun_pool_latency_avg_ms{{pool=\"{}\"}} {:.2}\n", pool_name, summary.avg_ms));
+    }
+    output.push('\n');
+
+    output.push_str("# HELP bakpiarun_request_duration_milliseconds Request latency histogram per pool in milliseconds\n");
+    output.push_str("# TYPE bakpiarun_request_duration_milliseconds histogram\n");
+    for pool_name in pm.pools.keys() {
+        if let Some(pm_stats) = metrics.pools.get(pool_name) {
+            for (i, &le) in LATENCY_BUCKETS_MS.iter().enumerate() {
+                output.push_str(&format!(
+                    "bakpiarun_request_duration_milliseconds_bucket{{pool=\"{}\",le=\"{}\"}} {}\n",
+                    pool_name, le, pm_stats.bucket_counts[i]
+                ));
+            }
+            output.push_str(&format!(
+                "bakpiarun_request_duration_milliseconds_bucket{{pool=\"{}\",le=\"+Inf\"}} {}\n",
+                pool_name, pm_stats.requests
+            ));
+            output.push_str(&format!(
+                "bakpiarun_request_duration_milliseconds_sum{{pool=\"{}\"}} {:.3}\n",
+                pool_name, pm_stats.duration_sum_ms
+            ));
+            output.push_str(&format!(
+                "bakpiarun_request_duration_milliseconds_count{{pool=\"{}\"}} {}\n",
+                pool_name, pm_stats.requests
+            ));
+        }
+    }
+    output.push('\n');
     
     output.push_str("# HELP bakpiarun_worker_requests_total Requests per worker\n");
     output.push_str("# TYPE bakpiarun_worker_requests_total counter\n");
