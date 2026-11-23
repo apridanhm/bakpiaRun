@@ -430,6 +430,15 @@ while ($running) {
                 }
                 $body = (string)ob_get_clean();
 
+                // Auto-format output phpinfo() CLI datar menjadi tabel HTML resmi bergaya PHP 8.3 (0% overhead untuk halaman lain)
+                if (str_starts_with(ltrim($body), "phpinfo()\nPHP Version => ")) {
+                    $fmtFile = __DIR__ . '/../lib/BakpiaPhpInfoFormatter.php';
+                    if (is_file($fmtFile)) {
+                        require_once $fmtFile;
+                        $body = bakpiarun_format_cli_phpinfo($body);
+                    }
+                }
+
                 $respHeaders = $GLOBALS['__BAKPIARUN_HEADERS'];
                 $respCookies = $GLOBALS['__BAKPIARUN_COOKIES'];
                 if (function_exists('headers_list')) {
