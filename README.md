@@ -1,126 +1,100 @@
 <p align="center">
-  <img src="public/bakpiarun-logo.png" alt="bakpiaRun Logo" width="380">
+  <img src="public/bakpiarun-logo.png" alt="bakpiaRun Logo" width="360">
 </p>
 
 <h1 align="center">bakpiaRun</h1>
+
 <p align="center">
-  <strong>Cloud-Native PHP 8.3 Application Runtime Built in Rust</strong><br>
-  Workload-Aware Multi-Pool Routing &bull; Proactive Anti-OOM Engine &bull; Persistent Keep-Alive UDS &bull; Secure MySQL Wire Proxy
+  <strong>A fast, friendly PHP 8.3 runtime powered by Rust.</strong><br>
+  Built to keep your containers alive, your fast endpoints snappy, and your setup simple.
+</p>
+
+<p align="center">
+  <a href="#-english"><strong>🇬🇧 English</strong></a> &nbsp;&bull;&nbsp; <a href="#-bahasa-indonesia"><strong>🇮🇩 Bahasa Indonesia</strong></a>
 </p>
 
 ---
 
-**bakpiaRun** adalah *application server runtime* modern berbasis **Rust (`Axum` + `Tokio` + `Hyper`)** yang mengeksekusi aplikasi PHP di atas **Persistent PHP 8.3 CLI Workers** melalui komunikasi **Unix Domain Socket (UDS)** berkecepatan tinggi. Dirancang khusus untuk lingkungan kontainer (*Docker / Kubernetes*) guna mengatasi masalah *Head-of-Line (HoL) Blocking*, kebocoran memori worker jangka panjang, dan insiden `OOMKilled (Exit Code 137)`.
+<a id="-english"></a>
+
+## 🇬🇧 English
+
+### Why bakpiaRun?
+
+Running PHP in production (especially inside Docker or Kubernetes) usually comes with a few classic headaches:
+1. **One heavy request slows everyone down.** Somebody triggers a massive report export, eats up your worker pool, and suddenly normal users just opening the homepage are stuck waiting.
+2. **Containers randomly die with `OOMKilled (Exit 137)`.** Long-running PHP processes hold onto memory over time until Linux loses patience and kills the whole container—dropping active user requests along with it.
+3. **Too many moving parts.** Stitching together Nginx, PHP-FPM, supervisord, a connection pooler, and a queue worker just to ship one app gets tiring fast.
+
+**bakpiaRun** puts a lightweight **Rust (`Axum` + `Tokio`)** engine in front of **persistent PHP 8.3 CLI workers** talking over Keep-Alive **Unix Domain Sockets**. PHP stays warm in memory (so it's super fast), while Rust handles HTTP/2, static files, smart routing, memory protection, and database pooling in one neat package.
 
 ---
 
-## Fitur Utama
+### What Makes It Cool
 
-### 1. Workload-Aware Multi-Pool Router
-- Memisahkan trafik ringan (**`fast` pool**) dan komputasi/query berat (**`heavy` pool**) ke kolam pekerja terisolasi.
-- Klasifikasi dua lapis yang diatur penuh dari YAML:
-  1. **Atribut HTTP Header** (mis. `X-Workload: heavy`, `X-Pool: fast`).
-  2. **Pencocokan Pola URL** (mis. `/heavy-*`, `/api/report/*`, `/api/export/*`).
-- Penjadwalan **Lock-Free Idle-First / Least-Loaded** berbasis operasi atomik CPU (`AtomicUsize::compare_exchange`) tanpa *pool-wide lock contention*.
+- **🛣️ Fast Lane & Heavy Lane (`Workload-Aware Router`)**  
+  Split your workers into separate pools (like `fast` and `heavy`). Route requests automatically using **URL patterns** (`/api/export/*`, `/heavy-*`) or **HTTP headers** (`X-Workload: heavy`). Heavy jobs stay in their own lane and never block regular users.
 
-### 2. Proactive Anti-OOM Engine (`/proc/[pid]/status` + `cgroups v2`)
-- **Telemetri Memori Proses Kernel**: Membaca `VmRSS` & `VmHWM` langsung dari `/proc/[pid]/status` di samping telemetri internal ZendMM (`memory_get_peak_usage`).
-- **Telemetri Kontainer Agregat**: Memantau tekanan memori kontainer secara *real-time* melalui **`cgroups v2`** (`/sys/fs/cgroup/memory.current` & `memory.max`, dengan fallback otomatis ke `cgroups v1` / `/proc/meminfo`).
-- **Graceful Worker Recycling (0ms P99 Impact)**: Saat worker melewati ambang batas proaktif (misal `80%`), worker ditandai `draining`, menyelesaikan request aktif, lalu didaur ulang secara asinkron di background tanpa menjatuhkan satu pun koneksi klien.
+- **🛡️ Proactive Anti-OOM (No More Surprise `Exit 137`)**  
+  Instead of waiting for a crash, bakpiaRun checks each worker's real OS memory (`/proc/[pid]/status` `VmRSS`) and overall container memory (`cgroups v2`). When a worker gets close to its limit (say 80%), bakpiaRun stops sending it new traffic, lets it finish its current request, and swaps in a fresh worker in the background. Zero dropped requests, zero latency spikes.
 
-### 3. Persistent Keep-Alive UDS & Kompatibilitas Framework Modern
-- Pipa **Keep-Alive Unix Domain Socket** dengan framing biner *4-byte Big-Endian length-prefixed JSON* (*cancel-safe* & *auto-reconnect*).
-- **Isolated Static Closure Sandbox + `gc_mem_caches()`**: Variabel lokal skrip tidak bocor antar-request dan memori besar (>8 MB) langsung dikembalikan ke kernel Linux setelah request selesai.
-- Mendukung **PHP Native**, **REST Microservices** (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `HEAD`, multi `Set-Cookie`, `front_controller`), serta **Persistent Laravel Worker Bridge** ([`lib/BakpiaLaravelBridge.php`](lib/BakpiaLaravelBridge.php)) yang mem-*boot* aplikasi Laravel cukup 1 kali di RAM.
+- **⚡ Keep-Alive Unix Sockets + Automatic RAM Cleanup**  
+  Rust and PHP talk over persistent Unix sockets with lock-free *Idle-First* scheduling. Each PHP request runs inside an isolated scope that cleans up big temporary memory chunks (`gc_mem_caches`) right after the request finishes.
 
-### 4. Secure Database Proxy & Async Job Queue
-- **Secure MySQL/MariaDB Wire-Protocol Proxy (`127.0.0.1:3307`)**: Mendukung protokol teks (`COM_QUERY`) maupun *native binary prepared statements* (`COM_STMT_PREPARE` `0x16` / `COM_STMT_EXECUTE` `0x17`), *Credential Masking*, *Dynamic Version Spoofing*, dan *Transaction-Aware Connection Pinning* (`BEGIN` / `COMMIT` / `ROLLBACK`).
-- **In-Memory Async Job Queue**: Offloading tugas latar belakang (`/api/queue/submit`) dengan proteksi kapasitas `max_jobs` dan *Whitelist Handler Registry*.
+- **🔌 Built-in MySQL/MariaDB Connection Proxy (`127.0.0.1:3307`)**  
+  Your PHP scripts connect locally without needing the real DB password (*credential masking*). Under the hood, Rust pools backend connections, handles real binary prepared statements (`PDO::ATTR_EMULATE_PREPARES => false`), and pins connections automatically during `BEGIN` / `COMMIT` / `ROLLBACK` transactions.
 
-### 5. Hardening Keamanan (Anti-PHP2Shell) & Observabilitas
-- Menyuntikkan proteksi tingkat engine `-d allow_url_include=0`, `-d disable_functions=...`, dan *filesystem sandbox* `-d open_basedir=...` otomatis pada setiap worker PHP.
-- Dilengkapi TLS/HTTPS (`HTTP/2` via `rustls`), *Token Bucket Rate Limiter*, *Security Headers*, *Zero-Downtime Rolling Reload* (`SIGHUP` / `/reload`), serta telemetri **JSON `/health`** dan **Prometheus `/metrics`** (termasuk persentil latensi `P50`/`P95`/`P99` per pool).
+- **🚀 Works with Native PHP, REST APIs & Laravel**  
+  Full support for `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, clean front-controller URLs, multiple `Set-Cookie` headers, and a built-in **Laravel Persistent Bridge** that boots Laravel once in memory and reuses it across thousands of requests.
+
+- **🔒 Hardened Out of the Box (Anti-PHP2Shell)**  
+  Automatically locks down dangerous shell functions (`exec`, `shell_exec`, `system`, `proc_open`, etc.) and sandboxes file access via `open_basedir`, all configurable from a single YAML file.
 
 ---
 
-## Arsitektur Sistem
+### How It Works Under the Hood
 
 ```text
-[ HTTP/1.1 & HTTPS (HTTP/2) Clients ]
-                 │
-                 ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    bakpiaRun Engine (Rust: Axum + Tokio)                │
-│                                                                         │
-│  ├─ Rate Limiter & Security Headers Middleware                          │
-│  ├─ Direct Static Asset Server (ETag, Cache-Control, Last-Modified)     │
-│  ├─ Workload-Aware Router (HTTP Header Rules + URL Pattern Rules)       │
-│  │     ├──► [ Fast Pool  ] (Idle-First Atomic Dispatch, Keep-Alive UDS) │
-│  │     └──► [ Heavy Pool ] (Isolated Workers, Independent Timeouts/RAM) │
-│  ├─ Proactive Anti-OOM Engine (/proc/[pid]/status VmRSS + cgroups v2)   │
-│  ├─ Async Job Queue (/api/queue/submit + Whitelisted Handlers)          │
-│  └─ Secure DB Proxy (127.0.0.1:3307 ──► Pooled MySQL/MariaDB Backend)   │
-└─────────────────────────────────────────────────────────────────────────┘
+Browser / API Client
+         │
+         ▼  HTTP/1.1 or HTTPS (HTTP/2)
+┌──────────────────────────────────────────────────────────────────────┐
+│                     bakpiaRun Server (Rust + Axum)                   │
+│                                                                      │
+│  • Static files (.css, .js, images) ──► Served directly by Rust      │
+│  • Workload-Aware Router (checks HTTP Headers, then URL Patterns)    │
+│       ├──► Normal traffic ──► [ Fast Pool  ] (e.g. 32 warm workers)  │
+│       └──► Heavy reports  ──► [ Heavy Pool ] (e.g.  8 warm workers)  │
+│  • Proactive Anti-OOM (/proc/[pid]/status VmRSS + cgroups v2)        │
+│  • Built-in Async Job Queue & Local MySQL Proxy (127.0.0.1:3307)     │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Struktur Proyek
+### Quick Start
 
-```text
-bakpiarun/
-├── src-server/                  # Rust Control & Ingress Plane
-│   └── src/
-│       ├── main.rs              # HTTP/HTTPS server, SIGTERM/SIGHUP lifecycle
-│       ├── config.rs            # Full YAML + Environment configuration
-│       ├── pool_manager.rs      # Workload-Aware Router (Header + URL)
-│       ├── worker_pool.rs       # Lock-free Idle-First scheduling & rolling reload
-│       ├── worker.rs            # PHP 8.3 supervisor & Anti-PHP2Shell hardening
-│       ├── anti_oom.rs          # /proc/[pid]/status & cgroups v2 monitor
-│       ├── ipc.rs               # Persistent Keep-Alive UDS framing
-│       ├── db_proxy/            # MySQL 4.1 Wire-Protocol Connection Pool Proxy
-│       ├── queue.rs             # Bounded async job queue
-│       ├── metrics.rs           # Per-pool P50/P95/P99 & Prometheus histograms
-│       └── handlers.rs          # HTTP, Health, Metrics, Reload & Queue endpoints
-├── src-worker/
-│   └── worker.php               # Persistent Keep-Alive PHP 8.3 Worker
-├── lib/
-│   ├── BakpiaLaravelBridge.php  # Persistent Laravel 8-12 Worker Bridge
-│   ├── BakpiaPhpInfoFormatter.php # Styled HTML phpinfo() formatter for CLI
-│   └── BakpiaQueue.php          # PHP client helper for Async Queue
-├── config/
-│   ├── bakpiarun.yaml           # Main runtime configuration
-│   ├── bakpiarun.docker.yaml    # Container-optimized configuration
-│   └── bakpiarun.example.yaml   # Documented reference configuration
-├── benchmarks/                  # Apple-to-apple k6 lab (vs PHP-FPM & FrankenPHP)
-├── public/                      # Default document root & verification endpoints
-└── Dockerfile                   # Multi-stage Alpine 3.21 + PHP 8.3 + OPcache image
-```
-
----
-
-## Cara Menjalankan
-
-### 1. Build & Jalankan secara Native (Linux / macOS)
+#### Option 1: Run Directly on Linux / macOS
+Make sure you have **Rust** and **PHP 8.3 CLI** (`pcntl`, `pdo_mysql`, `curl`, `mbstring`, `opcache`) installed.
 
 ```bash
 cd src-server
 
-# Jalankan unit test otomatis
+# Run unit tests (optional, super quick!)
 cargo test
 
-# Compile binary mode release yang teroptimasi penuh
+# Build the optimized release binary
 cargo build --release
 
-# Jalankan server menggunakan file konfigurasi YAML
+# Start the server
 ./target/release/bakpiarun-server --config ../config/bakpiarun.yaml
 ```
 
-### 2. Build & Jalankan menggunakan Docker (`cgroups v2` aktif)
-
+#### Option 2: Run with Docker
 ```bash
 docker build -t bakpiarun:latest .
 
+# Run with a 512MB limit so cgroups v2 memory tracking kicks in
 docker run -d \
   --name bakpiarun \
   --memory="512m" \
@@ -128,32 +102,134 @@ docker run -d \
   bakpiarun:latest
 ```
 
-### 3. Observabilitas & Zero-Downtime Reload
+---
+
+### Handy Admin Endpoints
+
+Protected by the `X-Admin-Token` (or `Authorization: Bearer`) header set in `config/bakpiarun.yaml`:
 
 ```bash
-# Cek status kesehatan per-pool, VmRSS, cgroups v2, dan persentil latensi
+# Detailed JSON health, per-pool P50/P95/P99 latency, VmRSS & cgroups v2 stats
 curl -H "X-Admin-Token: dev-token-for-local-testing" http://127.0.0.1:8080/health
 
-# Tarik metrik format Prometheus (untuk Grafana / evaluasi)
+# Prometheus metrics (ready for Grafana)
 curl -H "X-Admin-Token: dev-token-for-local-testing" http://127.0.0.1:8080/metrics
 
-# Zero-downtime rolling reload seluruh worker PHP
+# True zero-downtime rolling reload of all PHP workers
 curl -H "X-Admin-Token: dev-token-for-local-testing" http://127.0.0.1:8080/reload
 ```
 
 ---
 
-## Hasil Pengujian Performa (Release Build)
+### Speed & Stability Numbers
 
-| Skenario Uji | Metrik | Hasil |
-| :--- | :--- | :--- |
-| **Pure Light Dynamic PHP** (`6.400` req, Keep-Alive UDS) | Throughput & Latensi | **`3.755,9 req/detik`** &bull; `P50: 1,86 ms` &bull; `P95: 3,79 ms` &bull; `P99: 5,28 ms` &bull; `0% Error` |
-| **Mixed Workload + Memory Stress** (`Light` + `Heavy` + `Leak` simultan) | Isolasi Latensi & Anti-OOM | Pool `fast` terjaga di **`P50: 1,18 ms` (`P95: 5,66 ms`)** saat Pool `heavy` jenuh (`234 ms`) + **`10x Graceful Recycles` (`0% Dropped Requests`)** |
+Tested on the release build over persistent Keep-Alive UDS:
+- **Light Dynamic PHP**: **`3,755.9 req/sec`** (`P50: 1.86 ms`, `P95: 3.79 ms`, `P99: 5.28 ms`, `0% errors`).
+- **Mixed Traffic + Memory Stress**: Even while the `heavy` pool is hammered at `~235 ms` and recycling workers in the background, the `fast` pool stays smooth at **`P50: 1.18 ms` (`P95: 5.66 ms`)** with **zero dropped requests**.
 
-Untuk menjalankan suite benchmark komparatif **Grafana k6** melawan **Nginx + PHP-FPM 8.3** dan **FrankenPHP 8.3** pada batas kontainer identik (`2 vCPU`, `384 MB RAM`), lihat panduan lengkap di [`benchmarks/README.md`](benchmarks/README.md).
+Want to compare **bakpiaRun vs Nginx+PHP-FPM vs FrankenPHP** yourself using **Grafana k6**? Check out the ready-to-run lab in [`benchmarks/README.md`](benchmarks/README.md).
+
+---
+---
+
+<a id="-bahasa-indonesia"></a>
+
+## 🇮🇩 Bahasa Indonesia
+
+<p align="right"><a href="#-english">⬆️ Switch to English</a></p>
+
+### Kenapa Ada bakpiaRun?
+
+Kalau kita jalanin aplikasi PHP di server produksi (apalagi di dalam kontainer Docker atau Kubernetes), biasanya ada tiga penyakit klasik yang sering bikin pusing:
+1. **Satu request berat bikin pengguna lain ikut lemot.** Misalnya ada admin lagi tarik laporan transaksi puluhan ribu baris—worker langsung penuh, dan user biasa yang cuma mau buka halaman depan malah ikut bengong nungguin antrean.
+2. **Kontainer tiba-tiba mati kena `OOMKilled (Exit 137)`.** Worker PHP yang nyala terus lama-lama suka nahan pemakaian RAM. Begitu lewat batas kontainer, Linux langsung menembak mati kontainernya dan request user yang lagi jalan ikut putus.
+3. **Setup yang terlalu ribet.** Mau deploy satu aplikasi saja harus ngurusin Nginx, PHP-FPM, supervisord, connection pooler database, sampai worker antrean secara terpisah.
+
+**bakpiaRun** menyatukan semuanya dengan menaruh mesin **Rust (`Axum` + `Tokio`)** yang super ringan di depan **worker PHP 8.3 CLI persisten** yang ngobrol lewat jalur lokal **Unix Domain Socket**. Proses PHP-nya tetap hangat di memori (jadi kencang banget karena nggak perlu *booting* ulang tiap request), sementara Rust mengurus HTTP/2, file statis, pembagian jalur beban kerja, penjaga memori, sampai proxy database dalam satu binary.
 
 ---
 
-## Lisensi
+### Fitur Unggulan (Tanpa Bahasa Ribet)
 
-Proyek ini dilisensikan di bawah ketentuan yang tertera pada berkas [LICENSE](LICENSE).
+- **🛣️ Pisah Jalur Cepat & Jalur Berat (`Workload-Aware Router`)**  
+  Kamu bisa membagi worker ke beberapa kolam terpisah (misalnya `fast` dan `heavy`) langsung dari file `bakpiarun.yaml`. Pengarahannya otomatis lewat **pola URL** (`/heavy-*`, `/api/report/*`) atau **HTTP Header** (`X-Workload: heavy`). Hasilnya? Proses laporan seberat apa pun nggak bakal mengganggu user lain di jalur cepat.
+
+- **🛡️ Penjaga Memori Proaktif (`Anti-OOM Engine`)**  
+  Daripada pasrah nunggu kontainer meledak, bakpiaRun rajin mengintip pemakaian RAM asli tiap proses PHP lewat `/proc/[pid]/status` (`VmRSS`) dan total RAM kontainer lewat `cgroups v2`. Kalau ada worker yang mulai gendut mendekati batas (misal 80%), bakpiaRun menyetop kiriman tugas baru ke worker itu, membiarkan tugas yang sedang jalan sampai tuntas, lalu menggantinya dengan proses baru yang segar secara diam-diam di background. **Nol error, nol request putus.**
+
+- **⚡ Pipa UDS Keep-Alive & Bersih-Bersih Memori Otomatis**  
+  Komunikasi Rust ke PHP memakai pipa socket yang terus terbuka (*keep-alive*) dan selalu memilih worker yang lagi nganggur duluan (*Idle-First*). Setiap skrip PHP dijalankan di ruang lingkup terisolasi sehingga variabel besar langsung dibersihkan dan dikembalikan ke OS begitu request beres.
+
+- **🔌 Proxy Database MySQL/MariaDB Bawaan (`127.0.0.1:3307`)**  
+  Kode PHP kamu cukup konek ke port lokal `3307` tanpa perlu tahu password database asli (*credential masking*). Di belakang layar, Rust yang mengatur *connection pool* agar database nggak jebol kebanjiran koneksi, mendukung *native prepared statements* (`PDO::ATTR_EMULATE_PREPARES => false`), dan otomatis mengunci satu koneksi utuh saat aplikasi menjalankan transaksi `BEGIN` / `COMMIT` / `ROLLBACK`.
+
+- **🚀 Siap untuk PHP Native, REST API, sampai Laravel**  
+  Mendukung penuh method `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, *clean URL* (`front_controller`), multi `Set-Cookie`, tampilan `phpinfo()` kustom berlogo bakpiaRun, hingga **Laravel Persistent Bridge** yang mem-*boot* aplikasi Laravel cukup sekali di RAM (mirip Laravel Octane!).
+
+- **🔒 Aman dari Bawaan (Anti-PHP2Shell)**  
+  Saat menyalakan worker PHP, Rust otomatis mematikan fungsi eksekusi shell berbahaya (`exec`, `shell_exec`, `system`, `proc_open`, dll.) dan mengurung akses folder lewat `open_basedir`. Semua tetap bisa kamu atur lewat YAML tanpa ada nilai yang *hardcode*.
+
+---
+
+### Cara Jalaninnya
+
+#### Opsi 1: Langsung di Mesin Linux / macOS
+Pastikan sudah terpasang **Rust** dan **PHP 8.3 CLI** (beserta ekstensi `pcntl`, `pdo_mysql`, `curl`, `mbstring`, `opcache`).
+
+```bash
+cd src-server
+
+# Cek semua unit test otomatis
+cargo test
+
+# Build binary versi release biar ngebut maksimal
+cargo build --release
+
+# Jalankan server
+./target/release/bakpiarun-server --config ../config/bakpiarun.yaml
+```
+
+#### Opsi 2: Pakai Docker
+```bash
+docker build -t bakpiarun:latest .
+
+# Jalankan dengan batas RAM 512MB supaya sensor cgroups v2 aktif bekerja
+docker run -d \
+  --name bakpiarun \
+  --memory="512m" \
+  -p 8080:8080 \
+  bakpiarun:latest
+```
+
+---
+
+### Endpoint Monitoring & Reload Tanpa Downtime
+
+Semua endpoint admin dilindungi token yang kamu atur di `server.admin_token` pada `config/bakpiarun.yaml`:
+
+```bash
+# Cek kondisi worker, RAM VmRSS, cgroups v2, dan latensi P50/P95/P99 tiap pool
+curl -H "X-Admin-Token: dev-token-for-local-testing" http://127.0.0.1:8080/health
+
+# Ambil metrik format Prometheus (tinggal sambung ke Grafana)
+curl -H "X-Admin-Token: dev-token-for-local-testing" http://127.0.0.1:8080/metrics
+
+# Reload ulang seluruh worker PHP secara bergiliran TANPA memutus trafik!
+curl -H "X-Admin-Token: dev-token-for-local-testing" http://127.0.0.1:8080/reload
+```
+
+---
+
+### Seberapa Kencang?
+
+Dari pengujian pada binary `--release`:
+- **Trafik PHP Dinamis Ringan**: Tembus **`3.755,9 request/detik`** dengan waktu respons tengah **`P50: 1,86 ms`** (`P95: 3,79 ms`, `P99: 5,28 ms`, `0% error`).
+- **Trafik Campuran + Tekanan Memori**: Saat kolam `heavy` sengaja dihajar beban berat (`~235 ms`) sekaligus simulasi bocor memori, kolam `fast` tetap melaju mulus di **`P50: 1,18 ms` (`P95: 5,66 ms`)** dan mesin Anti-OOM mendaur ulang worker di background tanpa menjatuhkan satu pun request pengguna.
+
+Kalau kamu mau mencoba adu performa langsung (**bakpiaRun vs Nginx+PHP-FPM vs FrankenPHP**) memakai **Grafana k6**, skrip dan kontainer ujinya sudah siap pakai di folder [`benchmarks/README.md`](benchmarks/README.md).
+
+---
+
+## License / Lisensi
+
+Dirilis di bawah lisensi yang tertera pada berkas [LICENSE](LICENSE).
