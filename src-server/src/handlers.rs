@@ -113,7 +113,7 @@ pub async fn php_handler(
         }
     };
 
-    // 🎯 WORKLOAD-AWARE ROUTER: Pilih pool berdasarkan atribut HTTP Header & URL pattern (1x lock PoolManager)
+    // WORKLOAD-AWARE ROUTER: Pilih pool berdasarkan atribut HTTP Header & URL pattern (1x lock PoolManager)
     let (pool_name, pool_arc) = {
         let pm = state.pool_manager.lock().await;
         match pm.get_pool_name_for_request(path, &headers) {
