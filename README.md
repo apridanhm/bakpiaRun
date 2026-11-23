@@ -5,7 +5,7 @@
 <h1 align="center">bakpiaRun</h1>
 
 <p align="center">
-  <strong>A fast, friendly PHP 8.3 runtime powered by Rust.</strong><br>
+  <strong>A fast, friendly PHP runtime powered by Rust.</strong><br>
   Built to keep your containers alive, your fast endpoints snappy, and your setup simple.
 </p>
 
@@ -26,7 +26,7 @@ Running PHP in production (especially inside Docker or Kubernetes) usually comes
 2. **Containers randomly die with `OOMKilled (Exit 137)`.** Long-running PHP processes hold onto memory over time until Linux loses patience and kills the whole container, dropping active user requests along with it.
 3. **Too many moving parts.** Stitching together Nginx, PHP-FPM, supervisord, a connection pooler, and a queue worker just to ship one app gets tiring fast.
 
-**bakpiaRun** puts a lightweight **Rust (`Axum` + `Tokio`)** engine in front of **persistent PHP 8.3 CLI workers** talking over Keep-Alive **Unix Domain Sockets**. PHP stays warm in memory (so it is super fast), while Rust handles HTTP/2, static files, smart routing, memory protection, and database pooling in one neat package.
+**bakpiaRun** puts a lightweight **Rust (`Axum` + `Tokio`)** engine in front of **persistent PHP CLI workers** talking over Keep-Alive **Unix Domain Sockets**. PHP stays warm in memory (so it is super fast), while Rust handles HTTP/2, static files, smart routing, memory protection, and database pooling in one neat package.
 
 ---
 
@@ -75,7 +75,7 @@ Browser / API Client
 ### Quick Start
 
 #### Option 1: Run Directly on Linux / macOS
-Make sure you have **Rust** and **PHP 8.3 CLI** (`pcntl`, `pdo_mysql`, `curl`, `mbstring`, `opcache`) installed.
+Make sure you have **Rust** and **PHP CLI** (`pcntl`, `pdo_mysql`, `curl`, `mbstring`, `opcache`) installed.
 
 ```bash
 cd src-server
@@ -145,7 +145,7 @@ Kalau kita jalanin aplikasi PHP di server produksi (apalagi di dalam kontainer D
 2. **Kontainer tiba-tiba mati kena `OOMKilled (Exit 137)`.** Worker PHP yang nyala terus lama-lama suka menahan pemakaian RAM. Begitu lewat batas kontainer, Linux langsung mematikan paksa kontainernya dan request user yang lagi jalan ikut putus.
 3. **Setup yang terlalu ribet.** Mau deploy satu aplikasi saja harus ngurusin Nginx, PHP-FPM, supervisord, connection pooler database, sampai worker antrean secara terpisah.
 
-**bakpiaRun** menyatukan semuanya dengan menaruh mesin **Rust (`Axum` + `Tokio`)** yang ringan di depan **worker PHP 8.3 CLI persisten** yang berkomunikasi lewat jalur lokal **Unix Domain Socket**. Proses PHP-nya tetap hangat di memori (jadi kencang karena tidak perlu *booting* ulang tiap request), sementara Rust mengurus HTTP/2, file statis, pembagian jalur beban kerja, penjaga memori, sampai proxy database dalam satu binary.
+**bakpiaRun** menyatukan semuanya dengan menaruh mesin **Rust (`Axum` + `Tokio`)** yang ringan di depan **worker PHP CLI persisten** yang berkomunikasi lewat jalur lokal **Unix Domain Socket**. Proses PHP-nya tetap hangat di memori (jadi kencang karena tidak perlu *booting* ulang tiap request), sementara Rust mengurus HTTP/2, file statis, pembagian jalur beban kerja, penjaga memori, sampai proxy database dalam satu binary.
 
 ---
 
@@ -174,7 +174,7 @@ Kalau kita jalanin aplikasi PHP di server produksi (apalagi di dalam kontainer D
 ### Cara Menjalankan
 
 #### Opsi 1: Langsung di Mesin Linux / macOS
-Pastikan sudah terpasang **Rust** dan **PHP 8.3 CLI** (beserta ekstensi `pcntl`, `pdo_mysql`, `curl`, `mbstring`, `opcache`).
+Pastikan sudah terpasang **Rust** dan **PHP CLI** (beserta ekstensi `pcntl`, `pdo_mysql`, `curl`, `mbstring`, `opcache`).
 
 ```bash
 cd src-server
