@@ -204,3 +204,73 @@ impl PoolManager {
         self.pools.get(name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn sample_pm() -> PoolManager {
+        let mut heavy_headers = HashMap::new();
+        heavy_headers.insert("X-Workload".to_string(), "heavy".to_string());
+        heavy_headers.insert("X-Pool".to_string(), "heavy".to_string());
+
+        let mut fast_headers = HashMap::new();
+        fast_headers.insert("X-Workload".to_string(), "light".to_string());
+
+        PoolManager {
+            pools: HashMap::new(),
+            routing_table: vec![
+                RoutingRule {
+                    pool_name: "heavy".to_string(),
+                    patterns: vec![
+                        "/heavy-db.php".to_string(),
+                        "/heavy-*".to_string(),
+                        "/api/report/*".to_string(),
+                    ],
+                    headers: heavy_headers,
+                },
+                RoutingRule {
+                    pool_name: "fast".to_string(),
+                    patterns: vec!["/*".to_string()],
+                    headers: fast_headers,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_url_pattern_classification() {
+        let pm = sample_pm();
+        assert_eq!(pm.get_pool_name_for_path("/"), Some("fast".to_string()));
+        assert_eq!(pm.get_pool_name_for_path("/users"), Some("fast".to_string()));
+        assert_eq!(
+            pm.get_pool_name_for_path("/heavy-db.php"),
+            Some("heavy".to_string())
+        );
+        assert_eq!(
+            pm.get_pool_name_for_path("/api/report/monthly"),
+            Some("heavy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_http_header_override_classification() {
+        let pm = sample_pm();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-workload", HeaderValue::from_static("heavy"));
+
+        // Even though URL is `/`, HTTP header attribute routes it to `heavy` pool!
+        assert_eq!(
+            pm.get_pool_name_for_request("/", &headers),
+            Some("heavy".to_string())
+        );
+
+        let mut light_override = HeaderMap::new();
+        light_override.insert("X-Workload", HeaderValue::from_static("light"));
+        assert_eq!(
+            pm.get_pool_name_for_request("/heavy-db.php", &light_override),
+            Some("fast".to_string())
+        );
+    }
+}

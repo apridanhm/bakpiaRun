@@ -293,3 +293,36 @@ impl AntiOomEngine {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_process_proc_status_current_pid() {
+        let pid = std::process::id();
+        let status = read_process_proc_status(pid).expect("Should read /proc/[pid]/status on Linux");
+        assert_eq!(status.pid, pid);
+        assert!(status.vm_rss_bytes > 0, "VmRSS must be > 0 bytes");
+        assert!(status.vm_hwm_bytes >= status.vm_rss_bytes || status.vm_hwm_bytes > 0);
+    }
+
+    #[test]
+    fn test_read_cgroup_v2_memory_custom_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let curr_file = dir.path().join("memory.current");
+        let max_file = dir.path().join("memory.max");
+
+        std::fs::write(&curr_file, "201326592\n").unwrap(); // 192 MB
+        std::fs::write(&max_file, "402653184\n").unwrap();  // 384 MB
+
+        let cg = read_cgroup_v2_memory(
+            curr_file.to_str().unwrap(),
+            max_file.to_str().unwrap(),
+        );
+        assert_eq!(cg.source, "cgroup_v2");
+        assert_eq!(cg.current_bytes, 201_326_592);
+        assert_eq!(cg.max_bytes, 402_653_184);
+        assert!((cg.usage_percent - 50.0).abs() < 0.01);
+    }
+}
+

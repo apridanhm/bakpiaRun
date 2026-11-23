@@ -141,7 +141,7 @@ async fn main() {
 
     // Initialize Job Queue (only if enabled)
     let job_queue: Option<Arc<JobQueue>> = if config.queue.enabled {
-        let queue = Arc::new(JobQueue::new());
+        let queue = Arc::new(JobQueue::new(config.queue.max_jobs));
         println!("Queue System initialized (max jobs: {})", config.queue.max_jobs);
         Some(queue)
     } else {
@@ -322,16 +322,6 @@ async fn main() {
         println!("[Queue Worker] DISABLED (queue is off)");
     }
 
-    // Graceful shutdown
-    let pool_manager_for_shutdown = state.pool_manager.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.unwrap();
-        println!("\n[Server] Shutting down gracefully...");
-        let pm = pool_manager_for_shutdown.lock().await;
-        pm.stop_all().await;
-        std::process::exit(0);
-    });
-
     // Graceful reload (SIGHUP)
     let state_for_reload = state.clone();
     let config_path = cli.config.clone();
@@ -364,12 +354,32 @@ async fn main() {
                 let mut config = state_for_reload.config.lock().await;
                 *config = new_config.clone();
             }
+
+            state_for_reload
+                .rate_limiter
+                .update_config(
+                    new_config.rate_limit.enabled,
+                    new_config.rate_limit.requests_per_minute,
+                    new_config.rate_limit.burst_size,
+                )
+                .await;
+
+            if let Some(ref q) = state_for_reload.queue {
+                q.set_max_jobs(new_config.queue.max_jobs);
+            }
             
-            let mut pm = state_for_reload.pool_manager.lock().await;
-            pm.update_routing_table(&new_config);
-            for (name, pool_arc) in &pm.pools {
+            let pools_snapshot = {
+                let mut pm = state_for_reload.pool_manager.lock().await;
+                pm.update_routing_table(&new_config);
+                pm.pools
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>()
+            };
+
+            for (name, pool_arc) in pools_snapshot {
                 println!("[Reload] Reloading pool '{}'...", name);
-                let pool_specific_config = if let Some(pc) = new_config.pools.iter().find(|p| &p.name == name) {
+                let pool_specific_config = if let Some(pc) = new_config.pools.iter().find(|p| &p.name == &name) {
                     PoolManager::build_pool_config(&new_config, pc)
                 } else {
                     new_config.clone()
@@ -382,9 +392,31 @@ async fn main() {
         }
     });
 
-    // HTTPS setup
+    // Cloud-Native Graceful Shutdown Coordinator (SIGINT / Ctrl+C & SIGTERM from Docker/Kubernetes)
     use axum_server::tls_rustls::RustlsConfig;
+    let https_handle = axum_server::Handle::new();
+    let https_handle_for_signal = https_handle.clone();
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let shutdown_notify_waiter = shutdown_notify.clone();
 
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n[Server] Received SIGINT (Ctrl+C), draining active connections...");
+            }
+            _ = sigterm.recv() => {
+                println!("\n[Server] Received SIGTERM (Container Stop), draining active connections...");
+            }
+        }
+
+        https_handle_for_signal.graceful_shutdown(Some(Duration::from_secs(10)));
+        shutdown_notify.notify_waiters();
+    });
+
+    // HTTPS setup
     if let Some(https_listener) = https_std_listener {
         println!("Setting up HTTPS server...");
         
@@ -406,6 +438,7 @@ async fn main() {
         tokio::spawn(async move {
             if let Err(e) = axum_server::from_tcp_rustls(https_listener, rustls_config)
                 .unwrap()
+                .handle(https_handle)
                 .serve(app_clone.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             {
@@ -417,14 +450,25 @@ async fn main() {
         });
     }
 
-    // Start HTTP server using pre-bound listener
+    // Start HTTP server using pre-bound listener with graceful connection draining
     if let Err(e) = axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>()
-    ).await {
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_notify_waiter.notified().await;
+    })
+    .await
+    {
         eprintln!("❌ HTTP server failed: {}", e);
         let pm = state.pool_manager.lock().await;
         pm.stop_all().await;
         std::process::exit(1);
     }
+
+    // Stop all PHP workers cleanly after HTTP & HTTPS servers finish draining in-flight requests
+    println!("[Server] Active HTTP connections drained. Stopping PHP worker pools...");
+    let pm = state.pool_manager.lock().await;
+    pm.stop_all().await;
+    println!("[Server] Shutdown complete.");
 }

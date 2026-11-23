@@ -46,9 +46,16 @@ pub async fn php_handler(
     let start_time = Instant::now();
     
     let client_ip = if let Some(forwarded) = headers.get("x-forwarded-for") {
-        forwarded.to_str().unwrap_or("unknown").to_string()
+        forwarded
+            .to_str()
+            .unwrap_or("unknown")
+            .split(',')
+            .next()
+            .unwrap_or("unknown")
+            .trim()
+            .to_string()
     } else if let Some(real_ip) = headers.get("x-real-ip") {
-        real_ip.to_str().unwrap_or("unknown").to_string()
+        real_ip.to_str().unwrap_or("unknown").trim().to_string()
     } else {
         addr.ip().to_string()
     };
@@ -56,7 +63,7 @@ pub async fn php_handler(
     // RATE LIMIT CHECK
     let rate_limit_headers = if let Ok(ip_addr) = client_ip.parse::<std::net::IpAddr>() {
         match state.rate_limiter.check_rate_limit(ip_addr).await {
-            Ok(headers) => Some(headers),
+            Ok(opt_headers) => opt_headers,
             Err(e) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 state.logger.log_error(
@@ -832,15 +839,35 @@ pub async fn reload_handler(State(state): State<AppState>) -> Response {
         let mut config = state.config.lock().await;
         *config = new_config.clone();
     }
-    
-    // reload semua pools menggunakan konfigurasi spesifik masing-masing pool
-    let mut pm = state.pool_manager.lock().await;
-    pm.update_routing_table(&new_config);
+
+    state
+        .rate_limiter
+        .update_config(
+            new_config.rate_limit.enabled,
+            new_config.rate_limit.requests_per_minute,
+            new_config.rate_limit.burst_size,
+        )
+        .await;
+
+    if let Some(ref q) = state.queue {
+        q.set_max_jobs(new_config.queue.max_jobs);
+    }
+
+    // Reload semua pools secara zero-downtime tanpa menahan lock PoolManager selama proses restart
+    let pools_snapshot = {
+        let mut pm = state.pool_manager.lock().await;
+        pm.update_routing_table(&new_config);
+        pm.pools
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>()
+    };
+
     let mut reload_results = Vec::new();
     
-    for (name, pool_arc) in &pm.pools {
+    for (name, pool_arc) in pools_snapshot {
         println!("[Reload] Reloading pool '{}'...", name);
-        let pool_specific_config = if let Some(pc) = new_config.pools.iter().find(|p| &p.name == name) {
+        let pool_specific_config = if let Some(pc) = new_config.pools.iter().find(|p| &p.name == &name) {
             crate::pool_manager::PoolManager::build_pool_config(&new_config, pc)
         } else {
             new_config.clone()
@@ -886,13 +913,21 @@ pub async fn submit_job(
         }
     };
     
-    let job_id = queue.submit(req.task, req.payload).await;
-    
-    Json(JobResponse {
-        job_id,
-        status: "pending".to_string(),
-        message: "Job successfully queued".to_string(),
-    }).into_response()
+    match queue.submit(req.task, req.payload).await {
+        Ok(job_id) => Json(JobResponse {
+            job_id,
+            status: "pending".to_string(),
+            message: "Job successfully queued".to_string(),
+        })
+        .into_response(),
+        Err(err_msg) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": err_msg
+            })),
+        )
+            .into_response(),
+    }
 }
 
 // Endpoint untuk cek status job

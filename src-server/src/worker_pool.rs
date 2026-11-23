@@ -128,27 +128,24 @@ impl WorkerPool {
         )
     }
 
-    // Rolling restart untuk graceful reload
+    /// True Zero-Downtime Rolling Reload:
+    /// Recycles existing workers ONE BY ONE using `graceful_recycle` (drain active requests -> restart)
+    /// while the rest of the pool continues serving live traffic without interruption.
     pub async fn reload(&mut self, config: &Config) -> Result<(), String> {
-        println!("[Reload] Starting rolling restart of workers...");
+        println!("[Reload] Starting zero-downtime rolling reload of workers...");
         self.config = config.clone();
-
-        println!("[Reload] Stopping old workers...");
-        self.stop_all().await;
 
         let new_count = config.php.worker_count;
         let old_count = self.workers.len();
+        let delay_ms = config.php.rolling_restart_delay_ms;
 
-        if new_count != old_count {
-            println!(
-                "[Reload] Worker count changed: {} → {}",
-                old_count, new_count
-            );
-            self.workers.clear();
-            self.slots.clear();
-            for i in 0..new_count {
+        // 1. Scale UP first if worker_count increased so extra capacity is online immediately
+        if new_count > old_count {
+            println!("[Reload] Scaling up workers: {} → {}", old_count, new_count);
+            for i in old_count..new_count {
                 let socket_path = config.get_worker_socket_path(i);
-                let worker = Worker::new(i, socket_path);
+                let mut worker = Worker::new(i, socket_path);
+                worker.start(config).await?;
                 self.slots.push(WorkerSlot {
                     in_flight: worker.in_flight.clone(),
                     draining: worker.draining.clone(),
@@ -157,18 +154,40 @@ impl WorkerPool {
             }
         }
 
-        println!("[Reload] Starting new workers...");
-        let delay_ms = config.php.rolling_restart_delay_ms;
-        for worker_arc in &self.workers {
+        // 2. Gracefully recycle existing workers one by one (0..min(old_count, new_count))
+        let common_count = old_count.min(new_count);
+        for i in 0..common_count {
+            let worker_arc = self.workers[i].clone();
             {
                 let mut worker = worker_arc.lock().await;
-                worker.start(config).await?;
+                worker.socket_path = config.get_worker_socket_path(i);
+                worker.graceful_recycle(config).await?;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            if delay_ms > 0 && i + 1 < common_count {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        // 3. Scale DOWN excess workers gracefully after active workers are refreshed
+        if new_count < old_count {
+            println!("[Reload] Scaling down workers: {} → {}", old_count, new_count);
+            for i in new_count..old_count {
+                let worker_arc = self.workers[i].clone();
+                let mut worker = worker_arc.lock().await;
+                worker.draining.store(true, Ordering::Release);
+                let mut waited = 0u64;
+                while worker.active_requests() > 0 && waited < 2000 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    waited += 10;
+                }
+                worker.stop().await;
+            }
+            self.workers.truncate(new_count);
+            self.slots.truncate(new_count);
         }
 
         println!(
-            "[Reload] Rolling restart complete! {} workers active",
+            "[Reload] Zero-downtime rolling reload complete! {} workers active",
             self.workers.len()
         );
         Ok(())

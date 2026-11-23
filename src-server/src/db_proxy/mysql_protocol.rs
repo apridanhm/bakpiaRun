@@ -719,3 +719,68 @@ pub fn decode_stmt_execute_params(
 
     Ok(values)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lenenc_roundtrip() {
+        for &val in &[0u64, 250, 251, 65535, 65536, 1_000_000] {
+            let encoded = lenenc_str(&vec![b'A'; val.min(1024) as usize]);
+            let (slice, consumed) = read_lenenc_bytes(&encoded).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(slice.len(), val.min(1024) as usize);
+        }
+    }
+
+    #[test]
+    fn test_format_datetime_and_null() {
+        assert_eq!(format_value_as_text(&Value::NULL), None);
+        let dt = Value::Date(2026, 11, 23, 14, 5, 9, 0);
+        assert_eq!(
+            format_value_as_text(&dt),
+            Some(b"2026-11-23 14:05:09".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_decode_stmt_execute_params_and_type_reuse() {
+        // Build COM_STMT_EXECUTE for 3 params: (INT 42, NULL, VARCHAR "bakpia?")
+        let mut pkt = vec![COM_STMT_EXECUTE];
+        pkt.extend_from_slice(&1u32.to_le_bytes()); // stmt_id = 1
+        pkt.push(0x00); // flags
+        pkt.extend_from_slice(&1u32.to_le_bytes()); // iteration_count = 1
+        pkt.push(0b0000_0010); // null_bitmap: param #1 is NULL
+        pkt.push(1); // new_params_bound = 1
+        // Types: LONG (0x03, signed), VARCHAR (0x0f), VARCHAR (0x0f)
+        pkt.extend_from_slice(&[0x03, 0x00, 0x0f, 0x00, 0x0f, 0x00]);
+        // Values for non-null params (#0 = 42i32, #2 = "bakpia?")
+        pkt.extend_from_slice(&42i32.to_le_bytes());
+        pkt.extend_from_slice(&lenenc_str(b"bakpia?"));
+
+        let mut stored_types = Vec::new();
+        let long_data = std::collections::HashMap::new();
+        let vals = decode_stmt_execute_params(&pkt, 3, &mut stored_types, &long_data).unwrap();
+        assert_eq!(vals.len(), 3);
+        assert_eq!(vals[0], Value::Int(42));
+        assert_eq!(vals[1], Value::NULL);
+        assert_eq!(vals[2], Value::Bytes(b"bakpia?".to_vec()));
+
+        // Second execution with new_params_bound = 0 must reuse stored_types!
+        let mut pkt2 = vec![COM_STMT_EXECUTE];
+        pkt2.extend_from_slice(&1u32.to_le_bytes());
+        pkt2.push(0x00);
+        pkt2.extend_from_slice(&1u32.to_le_bytes());
+        pkt2.push(0); // no NULLs
+        pkt2.push(0); // new_params_bound = 0!
+        pkt2.extend_from_slice(&99i32.to_le_bytes());
+        pkt2.extend_from_slice(&lenenc_str(b"second"));
+        pkt2.extend_from_slice(&lenenc_str(b"third"));
+
+        let vals2 = decode_stmt_execute_params(&pkt2, 3, &mut stored_types, &long_data).unwrap();
+        assert_eq!(vals2[0], Value::Int(99));
+        assert_eq!(vals2[1], Value::Bytes(b"second".to_vec()));
+        assert_eq!(vals2[2], Value::Bytes(b"third".to_vec()));
+    }
+}
