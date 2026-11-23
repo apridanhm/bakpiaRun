@@ -23,7 +23,10 @@ struct StoredStatement {
     long_data: HashMap<u16, Vec<u8>>,
 }
 
+const MAX_PREPARED_STMTS_PER_SESSION: usize = 4096;
+
 struct SessionState {
+    default_db: String,
     statements: HashMap<u32, StoredStatement>,
     next_stmt_id: u32,
     /// Backend connection pinned to this client while a transaction or stateful session setting is active
@@ -31,17 +34,20 @@ struct SessionState {
     in_explicit_tx: bool,
     autocommit_disabled: bool,
     session_pinned: bool,
+    db_switched: bool,
 }
 
 impl SessionState {
-    fn new() -> Self {
+    fn new(default_db: String) -> Self {
         Self {
+            default_db,
             statements: HashMap::new(),
             next_stmt_id: 1,
             pinned_conn: None,
             in_explicit_tx: false,
             autocommit_disabled: false,
             session_pinned: false,
+            db_switched: false,
         }
     }
 
@@ -57,7 +63,30 @@ impl SessionState {
     }
 
     fn should_keep_pinned(&self) -> bool {
-        self.in_explicit_tx || self.autocommit_disabled || self.session_pinned
+        self.in_explicit_tx || self.autocommit_disabled || self.session_pinned || self.db_switched
+    }
+
+    async fn reset_session(&mut self) {
+        if let Some(mut conn) = self.pinned_conn.take() {
+            if self.in_explicit_tx || self.autocommit_disabled {
+                let _ = conn.query_drop("ROLLBACK").await;
+            }
+            if self.autocommit_disabled {
+                let _ = conn.query_drop("SET autocommit = 1").await;
+            }
+            if self.session_pinned {
+                let _ = conn.query_drop("UNLOCK TABLES").await;
+            }
+            if self.db_switched && !self.default_db.is_empty() {
+                let safe_default = self.default_db.replace('`', "``");
+                let _ = conn.query_drop(format!("USE `{}`", safe_default)).await;
+            }
+        }
+        self.statements.clear();
+        self.in_explicit_tx = false;
+        self.autocommit_disabled = false;
+        self.session_pinned = false;
+        self.db_switched = false;
     }
 }
 
@@ -110,11 +139,26 @@ fn classify_sql_intent(sql: &str) -> TxIntent {
         }
     }
 
-    if upper.starts_with("LOCK TABLES") || upper.starts_with("CREATE TEMPORARY TABLE") {
+    if upper.starts_with("LOCK TABLES")
+        || upper.starts_with("CREATE TEMPORARY TABLE")
+        || upper.starts_with("USE ")
+    {
         return TxIntent::PinSession;
     }
 
     TxIntent::Normal
+}
+
+fn count_wire_packets(buf: &[u8]) -> u8 {
+    let mut offset = 0usize;
+    let mut count = 0u8;
+    while offset + 4 <= buf.len() {
+        let pkt_len =
+            (buf[offset] as usize) | ((buf[offset + 1] as usize) << 8) | ((buf[offset + 2] as usize) << 16);
+        count = count.wrapping_add(1);
+        offset += 4 + pkt_len;
+    }
+    count.max(1)
 }
 
 fn extract_mysql_error(err: &mysql_async::Error) -> (u16, [u8; 5], String) {
@@ -205,10 +249,14 @@ impl DbProxy {
             let _ = socket.set_nodelay(true);
             let pool = pool.clone();
             let version = server_version.clone();
+            let default_db = db_config.target.database.clone();
             let conn_id = NEXT_CLIENT_CONN_ID.fetch_add(1, Ordering::Relaxed);
 
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(&mut socket, pool, version, conn_id, is_debug).await {
+                if let Err(e) =
+                    Self::handle_client(&mut socket, pool, version, default_db, conn_id, is_debug)
+                        .await
+                {
                     if is_debug {
                         eprintln!("[DB Proxy] Client #{} error: {}", conn_id, e);
                     }
@@ -221,10 +269,11 @@ impl DbProxy {
         socket: &mut TcpStream,
         pool: Pool,
         server_version: String,
+        default_db: String,
         conn_id: u32,
         is_debug: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = SessionState::new();
+        let mut session = SessionState::new(default_db);
 
         // 1. Send Server HandshakeV10
         let scramble = generate_scramble(conn_id);
@@ -309,19 +358,69 @@ impl DbProxy {
                     socket.flush().await?;
                 }
                 COM_INIT_DB => {
-                    let db_name = String::from_utf8_lossy(&payload[1..]).trim().to_string();
+                    let db_name = String::from_utf8_lossy(&payload[1..])
+                        .trim_end_matches('\0')
+                        .trim()
+                        .to_string();
                     if is_debug {
                         println!("[DB Proxy] COM_INIT_DB: {}", db_name);
                     }
-                    // Validate safe identifier before issuing USE if pinned, otherwise acknowledge
                     let valid_ident = !db_name.is_empty()
                         && db_name
                             .chars()
                             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
                     if valid_ident {
-                        let pkt =
-                            build_ok_packet(seq_id.wrapping_add(1), 0, 0, session.status_flags());
-                        socket.write_all(&pkt).await?;
+                        // Execute real `USE \`db\`` on a pinned backend connection so schema switch actually takes effect!
+                        let mut conn: Conn = match session.pinned_conn.take() {
+                            Some(c) => c,
+                            None => match pool.get_conn().await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let (code, state, msg) = extract_mysql_error(&e);
+                                    socket
+                                        .write_all(&build_error_packet(
+                                            seq_id.wrapping_add(1),
+                                            code,
+                                            &state,
+                                            &msg,
+                                        ))
+                                        .await?;
+                                    socket.flush().await?;
+                                    continue;
+                                }
+                            },
+                        };
+                        match conn.query_drop(format!("USE `{}`", db_name)).await {
+                            Ok(_) => {
+                                session.db_switched = db_name != session.default_db;
+                                if session.should_keep_pinned() {
+                                    session.pinned_conn = Some(conn);
+                                }
+                                let pkt = build_ok_packet(
+                                    seq_id.wrapping_add(1),
+                                    0,
+                                    0,
+                                    session.status_flags(),
+                                );
+                                socket.write_all(&pkt).await?;
+                            }
+                            Err(e) => {
+                                if !matches!(e, mysql_async::Error::Io(_))
+                                    && session.should_keep_pinned()
+                                {
+                                    session.pinned_conn = Some(conn);
+                                }
+                                let (code, state, msg) = extract_mysql_error(&e);
+                                socket
+                                    .write_all(&build_error_packet(
+                                        seq_id.wrapping_add(1),
+                                        code,
+                                        &state,
+                                        &msg,
+                                    ))
+                                    .await?;
+                            }
+                        }
                     } else {
                         let pkt = build_error_packet(
                             seq_id.wrapping_add(1),
@@ -331,6 +430,13 @@ impl DbProxy {
                         );
                         socket.write_all(&pkt).await?;
                     }
+                    socket.flush().await?;
+                }
+                COM_CHANGE_USER | COM_RESET_CONNECTION => {
+                    // Used by PHP persistent connections (`PDO::ATTR_PERSISTENT => true` / `mysqli` `p:`)
+                    session.reset_session().await;
+                    let pkt = build_ok_packet(seq_id.wrapping_add(1), 0, 0, session.status_flags());
+                    socket.write_all(&pkt).await?;
                     socket.flush().await?;
                 }
                 COM_QUERY => {
@@ -388,16 +494,8 @@ impl DbProxy {
             }
         }
 
-        // Cleanup: if client disconnected with an open uncommitted transaction, roll it back cleanly
-        // before returning the connection to the pool!
-        if let Some(mut conn) = session.pinned_conn.take() {
-            if session.in_explicit_tx || session.autocommit_disabled {
-                let _ = conn.query_drop("ROLLBACK").await;
-            }
-            if session.session_pinned {
-                let _ = conn.query_drop("UNLOCK TABLES").await;
-            }
-        }
+        // Cleanup: reset any open uncommitted transaction, table lock, or DB switch before returning connection to pool
+        session.reset_session().await;
 
         Ok(())
     }
@@ -488,9 +586,9 @@ impl DbProxy {
 
                         while let Some(row) = result.next().await? {
                             let values = row.unwrap();
-                            write_buf
-                                .extend_from_slice(&build_text_row_packet(current_seq, &values));
-                            current_seq = current_seq.wrapping_add(1);
+                            let row_pkt = build_text_row_packet(current_seq, &values);
+                            current_seq = current_seq.wrapping_add(count_wire_packets(&row_pkt));
+                            write_buf.extend_from_slice(&row_pkt);
 
                             if write_buf.len() >= 65536 {
                                 socket.write_all(&write_buf).await?;
@@ -587,6 +685,19 @@ impl DbProxy {
         let num_params = backend_stmt.params().len() as u16;
         let columns: Vec<mysql_async::Column> = backend_stmt.columns().to_vec();
         let num_columns = columns.len() as u16;
+
+        if session.statements.len() >= MAX_PREPARED_STMTS_PER_SESSION {
+            socket
+                .write_all(&build_error_packet(
+                    seq_id.wrapping_add(1),
+                    1461,
+                    b"42000",
+                    "Can't create more than max_prepared_stmt_count statements",
+                ))
+                .await?;
+            socket.flush().await?;
+            return Ok(());
+        }
 
         let stmt_id = session.next_stmt_id;
         session.next_stmt_id = session.next_stmt_id.wrapping_add(1).max(1);
@@ -713,6 +824,14 @@ impl DbProxy {
             );
         }
 
+        let intent = classify_sql_intent(&query);
+        match intent {
+            TxIntent::Begin => session.in_explicit_tx = true,
+            TxIntent::SetAutocommitOff => session.autocommit_disabled = true,
+            TxIntent::PinSession => session.session_pinned = true,
+            _ => {}
+        }
+
         // Acquire session-pinned or pooled connection and execute natively via binary protocol (100% SQLi-safe!)
         let mut conn: Conn = match session.pinned_conn.take() {
             Some(c) => c,
@@ -735,11 +854,23 @@ impl DbProxy {
             Params::Positional(param_values)
         };
 
-        let status_flags = session.status_flags();
         let mut io_broken = false;
-
         {
-            match conn.exec_iter(query.as_str(), mysql_params).await {
+            let exec_res = conn.exec_iter(query.as_str(), mysql_params).await;
+            if exec_res.is_ok() {
+                match intent {
+                    TxIntent::CommitOrRollback => {
+                        session.in_explicit_tx = false;
+                    }
+                    TxIntent::SetAutocommitOn => {
+                        session.autocommit_disabled = false;
+                        session.in_explicit_tx = false;
+                    }
+                    _ => {}
+                }
+            }
+            let status_flags = session.status_flags();
+            match exec_res {
                 Ok(mut result) => {
                     let mut current_seq = seq_id.wrapping_add(1);
                     let columns: Vec<mysql_async::Column> = result
@@ -766,12 +897,13 @@ impl DbProxy {
 
                         while let Some(row) = result.next().await? {
                             let values = row.unwrap();
-                            write_buf.extend_from_slice(&build_binary_row_packet(
+                            let row_pkt = build_binary_row_packet(
                                 current_seq,
                                 &columns,
                                 &values,
-                            ));
-                            current_seq = current_seq.wrapping_add(1);
+                            );
+                            current_seq = current_seq.wrapping_add(count_wire_packets(&row_pkt));
+                            write_buf.extend_from_slice(&row_pkt);
 
                             if write_buf.len() >= 65536 {
                                 socket.write_all(&write_buf).await?;

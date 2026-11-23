@@ -9,11 +9,13 @@ pub const COM_INIT_DB: u8 = 0x02;
 pub const COM_QUERY: u8 = 0x03;
 pub const COM_STATISTICS: u8 = 0x09;
 pub const COM_PING: u8 = 0x0E;
+pub const COM_CHANGE_USER: u8 = 0x11;
 pub const COM_STMT_PREPARE: u8 = 0x16;
 pub const COM_STMT_EXECUTE: u8 = 0x17;
 pub const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
 pub const COM_STMT_CLOSE: u8 = 0x19;
 pub const COM_STMT_RESET: u8 = 0x1A;
+pub const COM_RESET_CONNECTION: u8 = 0x1F;
 
 // =====================================================================
 // Basic Framing & Length-Encoded Primitives
@@ -93,14 +95,44 @@ pub fn read_lenenc_bytes(data: &[u8]) -> Result<(&[u8], usize), String> {
     Ok((&data[hdr_len..hdr_len + len], hdr_len + len))
 }
 
-pub fn build_packet(seq_id: u8, payload: &[u8]) -> Vec<u8> {
-    let len = payload.len();
-    let mut packet = Vec::with_capacity(4 + len);
-    packet.push((len & 0xFF) as u8);
-    packet.push(((len >> 8) & 0xFF) as u8);
-    packet.push(((len >> 16) & 0xFF) as u8);
-    packet.push(seq_id);
-    packet.extend_from_slice(payload);
+/// Builds one or more MySQL wire packets (automatically splitting payloads >= 16MB - 1
+/// across 0xFFFFFF chunks per MySQL protocol spec) and advances `seq_id`.
+pub fn append_mysql_packet(out: &mut Vec<u8>, seq_id: &mut u8, payload: &[u8]) {
+    const MAX_PACKET_LEN: usize = 0x00FF_FFFF;
+    if payload.len() < MAX_PACKET_LEN {
+        let len = payload.len();
+        out.reserve(4 + len);
+        out.push((len & 0xFF) as u8);
+        out.push(((len >> 8) & 0xFF) as u8);
+        out.push(((len >> 16) & 0xFF) as u8);
+        out.push(*seq_id);
+        out.extend_from_slice(payload);
+        *seq_id = seq_id.wrapping_add(1);
+        return;
+    }
+
+    let mut offset = 0usize;
+    loop {
+        let rem = payload.len() - offset;
+        let chunk_len = rem.min(MAX_PACKET_LEN);
+        out.reserve(4 + chunk_len);
+        out.push((chunk_len & 0xFF) as u8);
+        out.push(((chunk_len >> 8) & 0xFF) as u8);
+        out.push(((chunk_len >> 16) & 0xFF) as u8);
+        out.push(*seq_id);
+        out.extend_from_slice(&payload[offset..offset + chunk_len]);
+        *seq_id = seq_id.wrapping_add(1);
+        offset += chunk_len;
+
+        if chunk_len < MAX_PACKET_LEN {
+            break;
+        }
+    }
+}
+
+pub fn build_packet(mut seq_id: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(4 + payload.len());
+    append_mysql_packet(&mut packet, &mut seq_id, payload);
     packet
 }
 
